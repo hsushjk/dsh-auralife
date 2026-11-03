@@ -2,7 +2,7 @@
 
 ![warn](./warn.png)
 
-[![DSH 插件](https://img.shields.io/badge/DeepSeek-Harness-Plugin-0078d6)]()
+[![DSH 插件](https://img.shields.io/badge/DeepSeek%20Harness%20Plugin-0078d6)]()
 [![平台](https://img.shields.io/badge/Linux-Windows-fcc624)]()
 
 DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力、执念、自我、冲动、器官，有一条不按会话隔离的命；记忆会生长、会联想、会遗忘
