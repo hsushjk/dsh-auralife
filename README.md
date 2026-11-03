@@ -49,6 +49,10 @@ DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力�
 
 5.安装客户端(可选)
 
+[Windows](https://github.com/hsushjk/auralife-client-win)
+
+[Android](https://github.com/hsushjk/auralife-client-android)
+
 ## 首次使用
 
 > [!IMPORTANT]
