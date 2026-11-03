@@ -1,6 +1,8 @@
-# AuraLife 自定义接入 TTS / STT / 生图
+# Interface.md — 自定义接入 TTS / STT / 生图
 
 AuraLife 的语音合成（TTS）、语音识别（STT）、生图三项能力支持「自定义接口」档：接你自己电脑上的模型或服务（GPT-SoVITS、SD WebUI、ComfyUI、FunASR、faster-whisper、各类 OpenAI 兼容服务……）。
+
+本文讲怎么接。三份文档分工：README.md 看项目全貌，DEV.md 做二次开发，本文只讲自定义接入。
 
 ## 工作原理
 

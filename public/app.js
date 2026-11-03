@@ -1092,7 +1092,7 @@ function renderEntry(e) {
   return '<div class="entry" data-eid="' + esc(e.id) + '">' +
     '<div class="entry-head"><span class="who">' + esc(fmtDay(e.at)) + '</span>' +
     (e.visibility === 'self' ? '<span class="visibility-tag">仅主人可见</span>' : '') +
-    '<span class="spacer"></span>' + (isOwner() ? '<button class="small ghost" data-del-entry="' + esc(e.id) + '">删除</button>' : '') + '</div>' +
+    '<span class="spacer"></span>' + '</div>' +
     '<div class="entry-text">' + esc(e.text) + '</div>' +
     '<div class="comments">' + (comments || '<div class="muted" style="font-size:12px">还没有留言</div>') +
     '<div class="c-input"><input type="text" placeholder="留句话…" data-cinput="' + esc(e.id) + '" /><button class="primary small" data-csend="' + esc(e.id) + '">留言</button></div>' +
@@ -1104,34 +1104,16 @@ function renderComment(c, entryId) {
     '<div class="comment" data-cid="' + esc(c.id) + '" data-rid="' + esc(r2.id) + '">' +
     '<span class="c-who">' + esc(r2.name || r2.from) + '</span><span class="c-text">' + esc(r2.text) + '</span>' +
     '<span class="c-time">' + esc(fmtClock(r2.at)) + '</span>' +
-    (canDelComment(r2) ? '<span class="c-acts"><button data-del-comment="' + esc(entryId) + '" data-cid="' + esc(c.id) + '" data-rid="' + esc(r2.id) + '">删除</button></span>' : '') +
     '</div>'
   )).join('')
   return '<div class="comment" data-cid="' + esc(c.id) + '">' +
     '<span class="c-who">' + esc(c.name || c.from) + '</span><span class="c-text">' + esc(c.text) + '</span>' +
     '<span class="c-time">' + esc(fmtClock(c.at)) + '</span>' +
-    (canDelComment(c) ? '<span class="c-acts"><button data-del-comment="' + esc(entryId) + '" data-cid="' + esc(c.id) + '">删除</button></span>' : '') +
     '</div>' + (replies ? '<div class="replies">' + replies + '</div>' : '')
 }
 
-function canDelComment(c) { return isOwner() || (me && c.from === me.subject) }
-
 function bindDiaryEvents(body) {
   body.onclick = async (e) => {
-    const del = e.target.closest('[data-del-entry]')
-    if (del) {
-      const r = await api('/api/diary/delete', { method: 'POST', body: { entryId: del.dataset.delEntry } })
-      toast(r.ok ? '删了' : (r.reason || '没删掉'), r.ok ? '' : 'err')
-      loadDiary()
-      return
-    }
-    const dc = e.target.closest('[data-del-comment]')
-    if (dc) {
-      const r = await api('/api/diary/comment/delete', { method: 'POST', body: { entryId: dc.dataset.delComment, commentId: dc.dataset.cid, replyId: dc.dataset.rid || '' } })
-      toast(r.ok ? '删了' : (r.reason || '没删掉'), r.ok ? '' : 'err')
-      loadDiary()
-      return
-    }
     const cs = e.target.closest('[data-csend]')
     if (cs) {
       const eid = cs.dataset.csend

@@ -1,4 +1,6 @@
-# AuraLife 二次开发指南
+# DEV.md — 二次开发指南
+
+给想改、想移植、想接 AuraLife 的开发者。项目定位一句话：**两个 core——bridge（人机交互桥梁）与 life（机 = 生命 + 记忆）**；纯 ESM、零运行时依赖、Node ≥ 18。
 
 ## 架构总览
 
@@ -50,8 +52,8 @@ dsh-auralife/
 ├── public/                单页前端：index.html（向导）、app.js（视图+设置）、app.css、js/（format/theme/sound/audio/views/life/logs）
 ├── client/client.js       DSH 客户端侧入口
 ├── personas/             出厂人设种子
-├── Interface.md          自定义接入文档
-└── clientdev.md          客户端开发文档
+├── Interface.md          自定义接入文档（三槽契约）
+└── clientdev.md          客户端开发文档（HTTP API / SSE / 踩坑清单）
 ```
 
 ## 核心概念

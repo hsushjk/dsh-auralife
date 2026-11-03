@@ -1,4 +1,4 @@
-# AuraLife 客户端开发文档
+# clientdev.md — 客户端开发文档
 
 给要写 AuraLife 客户端（Android / Windows / 任何能发 HTTP 的程序）的开发者。本文只讲**客户端怎么连 AuraLife**；自定义接入 TTS/STT/生图见 Interface.md，项目与二次开发见 README.md / DEV.md。
 
@@ -143,7 +143,7 @@ es.onmessage = (e) => {
 }
 ```
 
-## 避坑清单
+## 踩坑清单（审计确认过，逐条对照代码）
 
 1. 直连基址**不带** `/auralife` 前缀。
 2. 鉴权失败**默认 200 + ok:false**（错误字段 `reason` 为主、个别是 `message`）；`/api/stream` 与 `/api/media/*` 是 **401**。
@@ -155,3 +155,9 @@ es.onmessage = (e) => {
 8. PATCH /api/config 用嵌套对象；POST /api/wishes 用 `resolve` 字段。
 9. 无 API 版本化，按 `/api/state` 的 `version` 做兼容分支。
 10. `/api/organs/settings` 必须带 org（`?org=` 或 body `{org}`）。
+
+## 相关文档
+
+- README.md：项目说明与部署
+- DEV.md：二次开发（数据模型、生命周期、目录树）
+- Interface.md：自定义接入 TTS / STT / 生图

@@ -1,4 +1,4 @@
-# AuraLife-Web —— DSH bundle patch
+# AuraLife-Web —— DSH bundle patch（插件自带的挂载声明）
 #
 # 1) auralife：插件本体（宿主半边 src/host.js + 网页半边 public/）
 # 2) 两个 agent preset，只给 AuraLife-Web 自己建的会话用：

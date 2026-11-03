@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { dataDir } from '../../core/store.js'
 import { stickerPath } from '../../features/stickers.js'
@@ -29,7 +29,17 @@ export function register(router, ctx) {
     if (!me) return send(res, 401, { ok: false, reason: '没登录' })
     const id = decodeURIComponent(p.slice('api/media/'.length)).split('/')[0]
     if (!id) return send(res, 404, { ok: false, reason: '没有这个媒体' })
-    const file = mediaFileOf(ctx.chatIdOf(me.subject), id)
+    let file = mediaFileOf(ctx.chatIdOf(me.subject), id)
+    if (!file || !existsSync(file)) {
+      // Ta 画的图可能落在别的会话目录（她通过工具在后台会话里画，消息被推到主人的会话）
+      const mediaDir = dataDir('media')
+      file = null
+      for (const d of readdirSync(mediaDir).map((x) => join(mediaDir, x))) {
+        if (!statSync(d).isDirectory()) continue
+        const f = join(d, id)
+        if (existsSync(f)) { file = f; break }
+      }
+    }
     if (!file || !existsSync(file)) return send(res, 404, { ok: false, reason: '这个媒体已经过期了' })
     const etag = '"' + id + '"'
     if (String(req.headers['if-none-match'] || '') === etag) { res.writeHead(304, { etag }); return res.end() }

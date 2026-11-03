@@ -1,7 +1,7 @@
 {
   "name": "dsh-auralife",
   "version": "1.0.0",
-  "description": "住在DSH的数字生命插件",
+  "description": "AuraLife：住在网页里的 AI 数字生命 —— DeepSeek Harness 插件",
   "license": "MIT",
   "author": "hsushjk",
   "type": "module",

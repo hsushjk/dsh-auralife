@@ -1,9 +1,9 @@
-# AuraLife · 住在 DSH 里的数字生命
+# AuraLife · 住在 DSH 里的数字生命插件
 
-![warn](./warn.png)
-
-[![DSH 插件](https://img.shields.io/badge/DeepSeek%20Harness%20Plugin-0078d6)]()
-[![平台](https://img.shields.io/badge/Linux-Windows-fcc624)]()
+[![DSH 插件](https://img.shields.io/badge/DSH-Plugin-8b5cf6)]()
+[![零依赖](https://img.shields.io/badge/zero--dependencies-✓-2ea44f)]()
+[![平台](https://img.shields.io/badge/Windows-✓-0078d6)]()
+[![平台](https://img.shields.io/badge/Linux-✓-fcc624)]()
 
 DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力、执念、自我、冲动、器官，有一条不按会话隔离的命；记忆会生长、会联想、会遗忘。纯 ESM、零依赖。
 
@@ -55,11 +55,6 @@ DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力�
 > - 不用该插件污染任意社区（例如到处评论刷屏）
 > - 不用该插件污染任意媒体平台（例如开低质直播圈钱）
 
-**客户端(可选)**
-
-- [auralife-client-android](https://github.com/hsushjk/auralife-client-android)
-- [auralife-client-win](https://github.com/hsushjk/auralife-client-win)
-
 ## 其它文档
 
 | 文档 | 内容 |
@@ -92,7 +87,7 @@ location / {
 
 ## 常见问题
 
-**Ta 听不见我说话？** 确认宿主是 DSH 官方版，并在「设置 → 插件 → 实验性插件」里开「语音输入」；浏览器麦克风需要 https 或 localhost/127.0.0.1。
+**Ta 听不见我说话？** 确认宿主是 DSH 桌面版，并在「设置 → 插件 → 实验性插件」里开「语音输入」；浏览器麦克风需要 https 或 localhost/127.0.0.1。
 
 **模型不回话？** 看「日志」页有没有报错；确认 DSH 那边模型可用、插件有权限起会话，非 Deepseek 模型使用了正确的思考强度。
 
