@@ -1,0 +1,60 @@
+{
+  "name": "dsh-auralife",
+  "version": "1.0.0",
+  "description": "住在DSH的数字生命插件",
+  "license": "MIT",
+  "author": "hsushjk",
+  "type": "module",
+  "main": "src/host.js",
+  "exports": {
+    ".": "./src/host.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "client",
+    "personas",
+    "public",
+    "cordis.patch.yml",
+    "README.md",
+    "dshreadme.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin",
+    "web",
+    "ai-companion",
+    "persona"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hsushjk/dsh-aurachat.git"
+  },
+  "homepage": "https://github.com/hsushjk/dsh-aurachat#readme",
+  "bugs": {
+    "url": "https://github.com/hsushjk/dsh-aurachat/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ],
+      "external": [
+        "react"
+      ]
+    }
+  }
+}
