@@ -247,8 +247,7 @@ export function createLifeView(ctx) {
     const selfRows = ['traits', 'values', 'boundaries'].map((k) => {
       const items = self[k] || []
       const list = items.length ? items.map((it) => '<div class="mem-row"><div class="mem-text">' + esc(it.label) +
-        '<div class="mem-meta">信度 ' + Math.round((it.conf || 0) * 100) + '% · ' + esc(SRC_LABEL[it.src] || it.src || '') + '</div></div></div>').join('') : '<div class="muted" style="font-size:12px">' +
-        (k === 'boundaries' ? '还没长出来——底线是从「被明确冒犯 / 明确拒绝」的经历里长出来的，Ta 还没认定过「绝不可越过的线」。' : '还没有。') + '</div>'
+        '<div class="mem-meta">信度 ' + Math.round((it.conf || 0) * 100) + '% · ' + esc(SRC_LABEL[it.src] || it.src || '') + '</div></div></div>').join('') : '<div class="muted" style="font-size:12px">还没有。</div>'
       return '<div class="mem-group"><div class="mem-group-name">' + SELF_FIELD[k] + '（' + items.length + '）</div><div class="mem-body">' + list + '</div></div>'
     }).join('')
 

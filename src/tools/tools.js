@@ -307,7 +307,7 @@ export function buildTools(deps, { chat, level, sessionId }) {
     if (wishes) {
       tools.push(defineTool({
         name: 'web_edit_wishes',
-        description: '看一眼或改一改你心里最挂念的那些事（执念池）。action=read 读；append 添一件（text 写内容）；resolve 了结一件（text 写那件事的大意，模糊匹配）。这些是你主动找主人的由头，不是待办清单。',
+        description: '看一眼或改一改你心里最挂念的那些事（执念池）。action=read 读；append 添一件（text 只写事情本身，一句话，比如「提醒主人吃午饭」，别写操作描述）；resolve 了结一件（text 写那件事的大意，模糊匹配）。这些是你主动找主人的由头，不是待办清单。',
         properties: {
           action: { type: 'string', enum: ['read', 'append', 'resolve'], description: 'read=读，append=添一件，resolve=了结一件' },
           text: str('要添进去 / 要了结的那件事的大意'),
@@ -322,15 +322,18 @@ export function buildTools(deps, { chat, level, sessionId }) {
           }
           if (a === 'append') {
             if (!body) return { ok: false, message: '要说添什么' }
+            // 防污染：执念一句话就够；模型把工具返回的总结文案再 append 回来时，会写出「加了条…把…了结了」这种合并句
+            if (body.length > 80) return { ok: false, message: '太长了，就写事情本身（80 字内）' }
+            if (/了结|记下了|加了条|把「|把"/.test(body)) return { ok: false, message: '只写事情本身，别写操作描述' }
             const w = wishes.add(body)
-            return { ok: true, message: `记下了「${w?.text || body}」`, id: w?.id }
+            return { ok: true, message: '记下了', id: w?.id }
           }
           if (a === 'resolve') {
             if (!body) return { ok: false, message: '要说哪件事了结了' }
             const target = wishes.list().find((w) => w.status === 'open' && (w.text.includes(body) || body.includes(w.text)))
             if (!target) return { ok: false, message: '没找到这件挂念的事，用 read 看看' }
             wishes.resolve(target.id, '自己了结')
-            return { ok: true, message: `「${target.text}」了结了` }
+            return { ok: true, message: '了结了' }
           }
           return { ok: false, message: 'action 只有 read / append / resolve' }
         },
