@@ -1,6 +1,6 @@
 // ——回复解析：把模型输出拆成聊天消息项（AuraLife 自己的实现，2026-11 重写）——// 模型回复协议：<voice>…</voice> 语音、<sticker:标签> 表情、<poke/> 拍一拍、
-// <reply:N> 引用（挂到下一条气泡）、![](url) 图片、||| 分隔多条气泡。
-// 输出统一成 { kind: 'text'|'voice'|'sticker'|'image'|'poke', value, replyTo? }[]。
+// <reply:N> 引用（挂到下一条气泡）、![](url) 图片、<file:文件名>…</file> 发文件、||| 分隔多条气泡。
+// 输出统一成 { kind: 'text'|'voice'|'sticker'|'image'|'file'|'poke', value, replyTo? }[]。
 
 const SILENCE = '[沉默]'
 
@@ -58,7 +58,7 @@ function foldTextItems(items) {
 }
 
 // ——回复内嵌标记扫描：一次正则找出下一个标记，按标记类型产出消息项 ——
-const MARKER_RE = /<poke\s*\/?>|<reply:\s*(\d+)\s*>|<voice>([\s\S]*?)<\/voice>|<sticker:([^>]+?)>(?:\s*<\/sticker>)?|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g
+const MARKER_RE = /<poke\s*\/?>|<reply:\s*(\d+)\s*>|<voice>([\s\S]*?)<\/voice>|<sticker:([^>]+?)>(?:\s*<\/sticker>)?|<file:([^>]+?)>([\s\S]*?)<\/file>|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g
 
 // 纯文本段落（可能是好几行），拆成可独立发送的消息项，同时过滤「模型自我规划」碎语
 const PLANNER_PREFIXES = /^(回复|答|接着回|然后(再)?加|不过要注意|这里第)/
@@ -117,7 +117,10 @@ export function parseReply(text) {
         const tag = match[3].trim()
         if (tag) items.push({ kind: 'sticker', value: tag })
       } else if (match[4] !== undefined) {
-        items.push({ kind: 'image', value: match[4] })
+        const content = stripMarkdown(match[5]).trim()
+        if (content) items.push({ kind: 'file', value: content, name: match[4].trim() })
+      } else if (match[6] !== undefined) {
+        items.push({ kind: 'image', value: match[6] })
       }
       attachPending(mid)
       consumed = MARKER_RE.lastIndex

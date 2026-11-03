@@ -357,10 +357,27 @@ export function createHub({
   async function sendImage(chatId, src) {
     try {
       const buf = Buffer.isBuffer(src) ? src : await fetchImage(src, { maxBytes: 10 * 1024 * 1024 })
-      appendMessage(chatId, { who: 'bot', text: '[图片]', kind: 'image', image: buf.toString('base64'), imageMime: mimeOf(buf) || 'image/png', mark: 'ai-image' })
+      const mime = mimeOf(buf)
+      if (mime && mime.startsWith('image/')) {
+        appendMessage(chatId, { who: 'bot', text: '[图片]', kind: 'image', image: buf.toString('base64'), imageMime: mime, mark: 'ai-image' })
+        bump('images')
+        return true
+      }
+      // 内容不是图片（模型把文字塞进了 ![]()）：按文本文件发，别让客户端解出一张坏图
+      return sendFile(chatId, buf.toString('utf8'), 'message.txt')
+    } catch (e) { log.warn('图片发不出去：' + e.message); return false }
+  }
+
+  async function sendFile(chatId, content, name) {
+    try {
+      const text = String(content || '')
+      if (!text.trim()) { log.warn('文件内容是空的，不发了'); return false }
+      const fileName = String(name || 'message.txt').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || 'message.txt'
+      const saved = history.saveMedia(chatId, Buffer.from(text, 'utf8').toString('base64'), 'text/plain')
+      appendMessage(chatId, { who: 'bot', text: '[文件] ' + fileName, kind: 'file', fileName, fileMime: 'text/plain', mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes: saved.bytes, mark: 'ai-file' })
       bump('images')
       return true
-    } catch (e) { log.warn('图片发不出去：' + e.message); return false }
+    } catch (e) { log.warn('文件发不出去：' + e.message); return false }
   }
 
   async function deliver(chatId, text, opts = {}) {
@@ -381,9 +398,10 @@ export function createHub({
       else if (it.kind === 'voice') { if (cfg.voice.enabled) await sendVoice(chatId, it.value); else await sendText(chatId, it.value) }
       else if (it.kind === 'sticker') await sendSticker(chatId, it.value)
       else if (it.kind === 'image') await sendImage(chatId, it.value)
+      else if (it.kind === 'file') await sendFile(chatId, it.value, it.name)
       if (i < items.length - 1) await sleep(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
     }
-    logChat(chatId, 'bot', items.map((i) => (i.kind === 'text' || i.kind === 'voice' ? i.value : `[${i.kind}]`)).join(' '))
+    logChat(chatId, 'bot', items.map((i) => (i.kind === 'text' || i.kind === 'voice' || i.kind === 'file' ? i.value : `[${i.kind}]`)).join(' '))
     lastChatAt = Date.now()
     if (isOwner(cfg, chatId)) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '' })

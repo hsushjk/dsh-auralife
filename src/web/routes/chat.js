@@ -43,12 +43,18 @@ export function register(router, ctx) {
       mediaType: i.mediaType || 'image/png',
       name: i.name || 'image',
     })).filter((i) => i.data)
-    // 任意后缀文件（//）：不设业务上限，只防单个超物理极限（base64 30M≈原文件 24MB）
-    const files = (Array.isArray(b.files) ? b.files : []).map((f) => ({
-      data: stripDataUrl(f.data),
-      mediaType: f.mediaType || 'application/octet-stream',
-      name: String(f.name || '文件').slice(0, 120),
-    })).filter((f) => f.data && f.data.length < 30 * 1024 * 1024)
+    // 任意后缀文件：不设业务上限，只防单个超物理极限（base64 30M≈原文件 24MB）；0 字节明确报错
+    const files = []
+    for (const f of Array.isArray(b.files) ? b.files : []) {
+      const data = stripDataUrl(f.data)
+      const name = String(f.name || '文件').slice(0, 120)
+      if (!data) continue
+      if (data.length >= 30 * 1024 * 1024) continue
+      try {
+        if (!Buffer.from(data, 'base64').length) return json(res, { ok: false, reason: '「' + name + '」读不出来（空文件）' })
+      } catch { /* 非法 base64 交给 hub 处理 */ }
+      files.push({ data, mediaType: f.mediaType || 'application/octet-stream', name })
+    }
     const voice = b.voice && b.voice.data ? { data: stripDataUrl(b.voice.data), mime: b.voice.mime || 'audio/webm', dur: Math.min(60, Math.max(1, Number(b.voice.dur) || 1)) } : null
     const sticker = String(b.sticker || '').trim()
     if (!text && images.length === 0 && files.length === 0 && !voice && !sticker) return json(res, { ok: false, reason: '没说啥' })

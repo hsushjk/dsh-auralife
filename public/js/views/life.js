@@ -116,7 +116,7 @@ export function createLifeView(ctx) {
     body.innerHTML =
       '<div class="ov-grid">' +
       chemCard +
-      card('体力', Math.round(en.level ?? 100) + ' / 100', bar(en.level ?? 100)) +
+      card('体力', Math.round(en.level ?? 100) + ' / 100') +
       card('冲动（主动找你的动力）', urge == null ? '—' : urge + ' / 100', '') +
       card('执念', String(openWishes.length), '件惦记着') +
       card('自我', String(selfCount), '条 · v' + (self.version || 0)) +
@@ -149,20 +149,14 @@ export function createLifeView(ctx) {
       '</div></div>'
   }
 
-  function bar(v) {
-    const p = Math.max(0, Math.min(100, v))
-    return '<span class="mini-bar"><i style="width:' + p + '%"></i></span>'
-  }
-
   // ---------- 内分泌 ----------
   function renderChemistry(body, r) {
     const chem = r.chemistry || {}
-    // 数值区：只给数值 + 血条（基线/半衰期/说明合并到「会推它的事」）
+    // 数值区：只给数值（基线/半衰期/说明合并到「会推它的事」）
     const rows = Object.keys(CHEM_META).map((k) => {
       const m = CHEM_META[k]
       const v = chem[k] ?? m.baseline
-      return '<div class="mem-row"><div class="mem-text">' + m.label + ' <b>' + fx(v) + '</b>' +
-        '<div class="mini-bar"><i style="width:' + Math.max(0, Math.min(100, v)) + '%"></i></div></div></div>'
+      return '<div class="mem-row"><div class="mem-text">' + m.label + ' <b>' + fx(v) + '</b></div></div>'
     }).join('')
     const hist = (chem.history || []).slice(0, 20)
     const histRows = hist.length ? hist.map((h) => {
@@ -201,12 +195,10 @@ export function createLifeView(ctx) {
     body.innerHTML =
       '<div class="section"><h3>体力</h3><div class="body">' +
       '<div class="ov-v" style="font-size:22px">' + Math.round(en.level ?? 100) + ' <span class="muted" style="font-size:13px">/ 100</span></div>' +
-      bar(en.level ?? 100) +
       '<div class="muted" style="font-size:12px;margin-top:6px">体力只跟作息走：醒着回话就消耗，不聊天干活就慢慢恢复，睡觉时恢复更快。</div>' +
       '</div></div>' +
       '<div class="section"><h3>冲动（主动找你的动力）</h3><div class="body">' +
       '<div class="ov-v" style="font-size:22px">' + (a ? a.urge : '—') + ' <span class="muted" style="font-size:13px">/ 100</span></div>' +
-      bar(urge) +
       '<div class="muted" style="font-size:12px;margin-top:6px">想不想找你，由 Ta 自己评估——以挂念着的事、心情、内分泌、你多久没来计算。冲动过 ' + (d.threshold ?? 55) + ' 且醒着，Ta 就会主动开口' + quietLine + '</div>' +
       assessLine +
       '</div></div>' +
