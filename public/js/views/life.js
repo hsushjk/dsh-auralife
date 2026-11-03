@@ -37,7 +37,7 @@ function wishTensionC(w, now = Date.now()) {
   return Math.max(0, Math.min(100, Math.round(base + ageH * rate - relief)))
 }
 
-const SRC_LABEL = { told: '他说过', inferred: '我推测', self_did: '我自己做的', manual: '手动', imagined: '想象的' }
+const SRC_LABEL = { told: '你说过', inferred: '我推测', self_did: '我自己做的', manual: '手动', imagined: '想象的' }
 const SELF_FIELD = { traits: '性格', values: '看重', boundaries: '底线' }
 
 export function createLifeView(ctx) {

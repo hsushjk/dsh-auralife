@@ -1152,7 +1152,7 @@ function renderMemory(main) {
   loadMemory()
 }
 
-const SRC_LABEL = { told: '他说过', inferred: '我推测', self_did: '我自己做的', manual: '手动', imagined: '想象的' }
+const SRC_LABEL = { told: '你说过', inferred: '我推测', self_did: '我自己做的', manual: '手动', imagined: '想象的' }
 
 async function loadMemory() {
   const body = $('#pane-body')
