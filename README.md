@@ -1,11 +1,11 @@
 # AuraLife · 住在 DSH 里的数字生命插件
 
-[![DSH 插件](https://img.shields.io/badge/DSH-Plugin-8b5cf6)]()
-[![零依赖](https://img.shields.io/badge/zero--dependencies-✓-2ea44f)]()
-[![平台](https://img.shields.io/badge/Windows-✓-0078d6)]()
-[![平台](https://img.shields.io/badge/Linux-✓-fcc624)]()
+![warn](./warn.png)
 
-DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力、执念、自我、冲动、器官，有一条不按会话隔离的命；记忆会生长、会联想、会遗忘。纯 ESM、零依赖。
+[![DSH 插件](https://img.shields.io/badge/DeepSeek-Harness-Plugin-0078d6)]()
+[![平台](https://img.shields.io/badge/Linux-Windows-fcc624)]()
+
+DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力、执念、自我、冲动、器官，有一条不按会话隔离的命；记忆会生长、会联想、会遗忘
 
 ## Ta 是什么
 
@@ -46,6 +46,8 @@ DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力�
 4. 也可以更省事：把项目链接丢给 DSH 让它帮你装。
 
 > 想让 Ta 在 DSH 里用工具（改文件、跑命令），需要在 DSH 那边给完全权限；只想聊天一般不需要；但为了避免出现兼容性问题，强烈建议给 **主人会话** 完整权限。
+
+5.安装客户端(可选)
 
 ## 首次使用
 
