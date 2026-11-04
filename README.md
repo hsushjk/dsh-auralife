@@ -31,23 +31,24 @@ DeepSeek Harness（DSH）插件。数字生命——内分泌三激素、体力�
 
 需要 [DeepSeek Harness 官方版](https://www.deepseek.com/en/harness/)（第三方未测试，无法保证）。
 
-1. 把整个目录放到你放插件的位置，比如 `D:\dsh-auralife`。
-2. 在 DSH 的 profile 里登记成依赖（路径换成你自己的）：
+1. 安装（任选其一）：
+   - 从 npm 安装：在 DSH 里执行 `dsh plugin add dsh-auralife`，或把 `"dsh-auralife": "^1.0.0"` 写进 profile 的 `dependencies`。
+   - 从源码安装：把整个目录放到你放插件的位置（比如 `D:\dsh-auralife`），再在 DSH 的 profile 里登记成依赖（路径换成你自己的）：
 
-   ```json
-   {
-     "dependencies": {
-       "dsh-auralife": "file:D:/dsh-auralife"
+     ```json
+     {
+       "dependencies": {
+         "dsh-auralife": "file:D:/dsh-auralife"
+       }
      }
-   }
-   ```
+     ```
 
-3. 重启 DSH。侧栏会出现「AuraLife」入口，或者用浏览器打开 `http://127.0.0.1:2332/`。
-4. 也可以更省事：把项目链接丢给 DSH 让它帮你装。
+2. 重启 DSH。侧栏会出现「AuraLife」入口，或者用浏览器打开 `http://127.0.0.1:2332/`。
+3. 也可以更省事：把项目链接丢给 DSH 让它帮你装。
 
 > 想让 Ta 在 DSH 里用工具（改文件、跑命令），需要在 DSH 那边给完全权限；只想聊天一般不需要；但为了避免出现兼容性问题，强烈建议给 **主人会话** 完整权限。
 
-5.安装客户端(可选)
+4. 安装客户端（可选）
 
 [Windows](https://github.com/hsushjk/auralife-client-win)
 

@@ -18,6 +18,7 @@
     "personas",
     "public",
     "cordis.patch.yml",
+    "warn.png",
     "README.md",
     "dshreadme.md",
     "LICENSE",
@@ -37,11 +38,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hsushjk/dsh-aurachat.git"
+    "url": "git+https://github.com/hsushjk/dsh-auralife.git"
   },
-  "homepage": "https://github.com/hsushjk/dsh-aurachat#readme",
+  "homepage": "https://github.com/hsushjk/dsh-auralife#readme",
   "bugs": {
-    "url": "https://github.com/hsushjk/dsh-aurachat/issues"
+    "url": "https://github.com/hsushjk/dsh-auralife/issues"
   },
   "dsh": {
     "bundle": {
