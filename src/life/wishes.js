@@ -45,7 +45,7 @@ function makeWish(text, meta) {
 export function createWishes({ getConfig, life, log }) {
   // 幂等：selfdrive.md → wishes 只做一次；改名 .bak 后不会再进。若心愿已非空也跳过。
   function migrateFromMemo() {
-    life.update((s) => {
+    return life.update((s) => {
       if (s.wishes.length) return
       const p = memoFile()
       let bullets = []
@@ -63,7 +63,7 @@ export function createWishes({ getConfig, life, log }) {
       const seed = bullets.length ? bullets : DEFAULT_WISHES.map((w) => w.text)
       s.wishes = seed.map((text) => makeWish(text, DEFAULT_WISHES.find((w) => w.text === text)))
       log.info(`心愿池初始化：${seed.length} 条`)
-    })
+    }).catch((error) => log.warn('心愿池初始化失败：' + (error?.message || error)))
   }
 
   function list() {

@@ -1,4 +1,4 @@
-import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, statSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -51,10 +51,16 @@ export function apply(ctx) {
   const getConfig = () => cfg
   // 开关已收窄只有 TTS/STT/生图/提示音四个需要开关，其余模块恒开。
   // 四个开关热生效——每次使用都现读 config。
+  // 配置落盘串行队列：内存 cfg 立即生效（热生效语义不变），磁盘写入排队执行。
+  // 多进程下 config.json 读-改-写必须进锁，但锁现在是异步的，不能阻塞调用方。
+  let configSaveChain = Promise.resolve()
   const setConfig = (patch) => {
-    // 多进程下 config.json 读-改-写要进锁（审计：无锁 RMW 会互相覆盖丢设置）。
-    cfg = withFileLock('config', () => saveConfig(mergeFromPanel(cfg, patch)), { staleMs: 5000, timeoutMs: 4000 })
+    const next = mergeFromPanel(cfg, patch)
+    cfg = next
     maxLogMB = Number(cfg.logs?.maxMB) || 2
+    configSaveChain = configSaveChain
+      .then(() => withFileLock('config', () => saveConfig(next), { staleMs: 5000, timeoutMs: 4000 }))
+      .catch((error) => { log.warn('配置保存失败：' + (error?.message || error)) })
   }
   seedPersonas()
 
@@ -89,7 +95,7 @@ export function apply(ctx) {
   wishes.migrateFromMemo()
   const self = createSelf({ life, dsh: ctx, getConfig, log: logger.child('self') })
   const bootstrappedGaps = new Set()
-  const bootstrap = createBootstrap({ dsh: ctx, getConfig, log: logger.child('organs') })
+  const bootstrap = createBootstrap({ dsh: ctx, getConfig, log: logger.child('organs'), audit: organHost.audit })
   const local = createLocal({ getConfig, log: logger })
   const imageGen = createImageGen({ getConfig, log: logger.child('imagegen'), local })
 
@@ -120,10 +126,15 @@ export function apply(ctx) {
         try { mkdirSync(dir, { recursive: true }) } catch (error) {}
         const file = join(dir, `${Date.now()}-${randomUUID()}.wav`)
         writeFileSync(file, wav16)
-        const out = await local.call('asr', { file, log: logger.child('local') })
-        const text = String(typeof out === 'string' ? out : out?.text || out?.transcript || '').trim()
-        if (!text) throw new Error('没听清（识别结果为空）')
-        return text
+        // 临时 wav 用完即删：识别成功、失败、超时都要清，别在 data 目录里越攒越多。
+        try {
+          const out = await local.call('asr', { file, log: logger.child('local') })
+          const text = String(typeof out === 'string' ? out : out?.text || out?.transcript || '').trim()
+          if (!text) throw new Error('没听清（识别结果为空）')
+          return text
+        } finally {
+          try { unlinkSync(file) } catch (error) {}
+        }
       }
       return transcribe(buf, mime, cfg.voice, logger.child('voice'), dshVoice())
     },
@@ -198,12 +209,12 @@ export function apply(ctx) {
         // 被感谢是社会性接纳，是血清素的核心来源（+2）。
         try {
           const d = scoreText(a.text)
-          if (d < -3) chemistry.event({ cortisol: Math.min(8, -d / 3), serotonin: -1 }, '被凶了一句')
-          else if (d > 3) chemistry.event({ dopamine: Math.min(6, d / 3), serotonin: 1 }, '被夸了一句')
-          if (/谢谢|多谢|感谢|辛苦/.test(a.text)) chemistry.event({ serotonin: 2, dopamine: 1 }, '被感谢了')
+          if (d < -3) chemistry.event({ cortisol: Math.min(8, -d / 3), serotonin: -1 }, '被凶了一句').catch(() => {})
+          else if (d > 3) chemistry.event({ dopamine: Math.min(6, d / 3), serotonin: 1 }, '被夸了一句').catch(() => {})
+          if (/谢谢|多谢|感谢|辛苦/.test(a.text)) chemistry.event({ serotonin: 2, dopamine: 1 }, '被感谢了').catch(() => {})
         } catch (error) {}
       }
-      if (a.kind === 'in') life.touch('interaction')
+      if (a.kind === 'in') life.touch('interaction').catch(() => {})
 
       // 主人一说话，「被冷落」窗口就打破（她主动搭话有人理了）。
       if (a.kind === 'in') { try { drive.clearSpoke() } catch {} }
@@ -216,8 +227,8 @@ export function apply(ctx) {
         judgeChem({ dsh: ctx, getConfig, life, userText: a.userText, reply: a.reply, who: a.userId === OWNER_ID ? ownerName : '对方', origin: speakUp ? 'speak-up' : 'user' })
           .then((r) => {
             if (r && Math.abs(r.delta) >= 5) {
-              if (r.delta < 0) chemistry.event({ cortisol: Math.min(6, -r.delta / 2), serotonin: -1 }, '这轮聊得不好')
-              else chemistry.event({ dopamine: Math.min(5, r.delta / 2), serotonin: 1 }, '这轮聊得开心')
+              if (r.delta < 0) chemistry.event({ cortisol: Math.min(6, -r.delta / 2), serotonin: -1 }, '这轮聊得不好').catch(() => {})
+              else chemistry.event({ dopamine: Math.min(5, r.delta / 2), serotonin: 1 }, '这轮聊得开心').catch(() => {})
             }
           })
           .catch(() => {})
@@ -225,19 +236,30 @@ export function apply(ctx) {
         try {
           const gap = findGapSentence(a.reply)
           if (gap && !wishes.list().some((w) => w.status === 'open' && w.text === gap)) {
-            wishes.add(gap, { baseTension: 80, tensionRate: 5 })
+            wishes.add(gap, { baseTension: 80, tensionRate: 5 }).catch(() => {})
             log.info('长出执念：「' + gap + '」')
           }
         } catch (error) {}
         // S1 器官自举：Ta 明确说「我做不了 X」/「我给自己捏了个 X」→ 生成器官，落盘立即生效。
+        // 只允许主人会话触发：客人把 Ta 带偏后让她自己写器官往外传文件，是沙箱要防的核心风险之一；
+        // 客人会话命中缺口只记审计、不自举（不改变对客人的回复，只是不落盘器官）。
         try {
           const capGap = capabilityGapText(a.reply)
+          const ownerTurn = a.level === 'full' || a.userId === OWNER_ID
           if (capGap && !bootstrappedGaps.has(capGap)) {
-            bootstrappedGaps.add(capGap)
-            if (bootstrappedGaps.size > 100) bootstrappedGaps.clear()
-            bootstrap.bootstrap(capGap)
-              .then(() => organHost.loadSelfMade().catch(() => {})) // 落盘后立刻扫进清单，不用重启 DSH
-              .catch(() => {})
+            if (!ownerTurn) {
+              organHost.audit.append({ event: 'bootstrap_skip', reason: 'guest-chat', chatId: a.chatId, userId: a.userId || '', gap: capGap.slice(0, 120) })
+            } else {
+              bootstrappedGaps.add(capGap)
+              if (bootstrappedGaps.size > 100) bootstrappedGaps.clear()
+              organHost.audit.append({ event: 'bootstrap', chatId: a.chatId, gap: capGap.slice(0, 120) })
+              bootstrap.bootstrap(capGap)
+                .then(() => organHost.loadSelfMade().catch(() => {})) // 落盘后立刻扫进清单，不用重启 DSH
+                .catch((error) => {
+                  log.warn('器官自举失败：' + (error?.message || error))
+                  organHost.audit.append({ event: 'bootstrap_failed', gap: capGap.slice(0, 120), error: String(error?.message || error).slice(0, 200) })
+                })
+            }
           }
         } catch (error) {}
       }
@@ -260,16 +282,20 @@ export function apply(ctx) {
 
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
+      let handled
       try {
         // 捕获 DSH 平台真实上下文窗口（request/context 事件带 contextWindow，dsh-context 面板显示 1M 就是它）
         if (event) {
           const w = Number(event.contextWindow ?? event.data?.contextWindow)
           if (Number.isFinite(w) && w > 0) hub.setLiveWindow(w, event.model ?? event.data?.model)
         }
-        hub.onSessionEvent(session, event)
+        handled = hub.onSessionEvent(session, event)
       } catch (error) {
         log.warn('会话事件处理出错：', error.message)
+        return
       }
+      // onSessionEvent 现在可能异步落盘（历史补丁/会话映射），失败也要接住，不能变成 unhandled rejection。
+      if (handled && typeof handled.catch === 'function') handled.catch((error) => log.warn('会话事件处理出错：' + (error?.message || error)))
     })
     return () => { try { if (typeof off === 'function') off() } catch (error) {} }
   }, 'auralife: 盯会话')
@@ -280,7 +306,7 @@ export function apply(ctx) {
   ctx.effect(() => {
     const off = ctx.on('agent/request', async (_payload, next) => {
       const current = await next()
-      try { energy.spend() } catch {} // 每次模型请求消耗一点血条
+      try { energy.spend().catch(() => {}) } catch {} // 每次模型请求消耗一点血条
       let chem
       try { chem = chemistry.peek() } catch { return current }
       let temperature
@@ -301,7 +327,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.interval(safe(whenReady(() => drive.tick()), '自驱'), 60_000), 'auralife: 自驱')
   ctx.effect(() => ctx.interval(safe(whenReady(async () => {
     // 跨天自我唤醒：扫她自己设的闹钟，到点逐个 fire（主动搭话），响完标记 fired。
-    const due = alarm.fireDue()
+    const due = await alarm.fireDue()
     for (const a of due) {
       try { await drive.fireAlarm(a) } catch (e) { log.warn('闹钟唤醒出错：', e.message) }
     }
@@ -320,7 +346,7 @@ export function apply(ctx) {
       const d = drive.state()
       if (d.lastSpokeAt && !d.coldMarked && Date.now() - d.lastSpokeAt >= 30 * 60_000) {
         if (hub.lastOwnerChatAt < d.lastSpokeAt) {
-          chemistry.event({ cortisol: 4, serotonin: -4, dopamine: -2 }, '主动搭话没人理')
+          chemistry.event({ cortisol: 4, serotonin: -4, dopamine: -2 }, '主动搭话没人理').catch(() => {})
           drive.markCold()
         }
       }

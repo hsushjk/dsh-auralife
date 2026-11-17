@@ -5,20 +5,22 @@
 //
 // 全 AI 托管，无人工审批：器官落盘 status=active，host.js 立刻 loadSelfMade 热加载。
 // （曾经有 pending/批准机制，但 DSH 的 agent 本身就有 shell/文件工具，能直接跑器官代码，
-// 批准只是假动作；所以取消人工审批，防线只剩下面的四重验证 + apiFor 白名单 + 熔断。）
+// 批准只是假动作；所以取消人工审批，防线是四重验证 + worker 运行时隔离 + 白名单 api + 审计 + 熔断。）
 //
 // 防「废器官」四重闸（AI 造器官容易废，所以落盘前先自检，废了就带着错误重写，最多 2 轮）：
-// 1. 语法检查（new Function 解析，宿主侧检查生成代码，安全）。
-// 2. guardOrgan 静态检查（拦 require/child_process/eval/process.env/非白名单 import）。
-// 3. 干跑：动态 import + create(stubApi)，meta/create 缺了或 create 抛错都算废。
-// 4. 工具检查：create(api) 里必须调 api.tools.add 注册至少一个工具——没注册工具的器官对 AI 来说等于不存在
+// 1. guardOrgan 静态检查（拦 require/child_process/eval/process/动态 import/全局 fetch/非白名单 import）。
+// 2. 干跑：在独立 worker 线程里 import + create(stubApi)，meta/create 缺了或 create 抛错都算废；
+//    同步死循环/process.exit 只杀这个 worker，不会卡住宿主。
+// 3. 工具检查：create(api) 里必须调 api.tools.add 注册至少一个工具——没注册工具的器官对 AI 来说等于不存在
 //    （之前「决策骰」器官 create() 没接 api、没注册工具，批准加载了 AI 也调不到）。
-// 落盘后由 host.js 立刻调 organHost.loadSelfMade() 热加载（不用重启 DSH）。
+// 4. 全部通过才落盘；落盘后由 host.js 立刻调 organHost.loadSelfMade() 热加载（不用重启 DSH）。
 //
-// 运行时安全：器官只拿到 create(api) 的白名单 api（net 只放行 http/https + store 只写自己目录
-// + llm 借模型的脑子 + tools.add 注册工具），拿不到 fs/process/globalThis。tick 连续 3 次异常熔断停用。
+// 运行时安全：self-made 器官跑在独立 Worker 里（organ-worker），拿到的只是宿主注入的 create(api) 白名单
+// （net 只放行 http/https 且禁内网 + store 只写自己目录 + llm 借模型的脑子 + tools.add 注册工具）；
+// 死循环/process.exit/崩溃只会杀 worker，宿主靠超时 terminate + 连续 3 次异常熔断，所有动作写器官审计。
 
 import { writeFileSync } from 'node:fs'
+import { Worker } from 'node:worker_threads'
 import { dataDir, writeJson, ensureDir } from '../core/store.js'
 import { guardOrgan } from './organ-guard.js'
 import { askModel } from '../core/llm.js'
@@ -91,42 +93,31 @@ function sanitizeId(s) {
   return v || 'organ-' + Date.now().toString(36)
 }
 
-// 四重验证：guard 静态 → import（语法+顶层执行）→ 干跑 create(stub)（2 秒超时）→ 工具注册检查。返回 null = 通过，否则返回失败原因。
+// 四重验证：guard 静态 → worker 里 import（语法+顶层执行）→ 干跑 create(stub)（4 秒超时）→ 工具注册检查。
+// 返回 null = 通过，否则返回失败原因。全程在独立 worker 线程里跑，死循环/process.exit 只杀 worker。
 export async function dryRun(code) {
   const g = guardOrgan(code)
   if (!g.ok) return 'guard 拒绝：' + g.problems.join('、')
-  let mod
-  try {
-    const url = 'data:text/javascript;charset=utf-8,' + encodeURIComponent(code) + '#' + Date.now()
-    mod = await import(url)
-  } catch (e) {
-    return '语法错误：' + e.message
-  }
-  try {
-    if (!mod.meta || !mod.meta.id) return '缺少 export const meta = { id }'
-    if (typeof mod.create !== 'function') return '缺少 export function create(api)'
-    const registered = []
-    const stub = {
-      log: { info() {}, warn() {}, error() {}, child() { return this } },
-      net: { fetchText: async () => '', fetchJson: async () => ({}) },
-      store: { get: () => null, set: () => {} },
-      tools: { add: (def) => { registered.push(def); return def.name } },
-      llm: { ask: async () => '' },
+  return await new Promise((resolve) => {
+    const worker = new Worker(new URL('./organ-dryrun-worker.js', import.meta.url), { workerData: { code } })
+    let settled = false
+    const finish = (reason) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { worker.terminate() } catch { /* 已退出 */ }
+      resolve(reason)
     }
-    const inst = await Promise.race([
-      mod.create(stub),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('干跑超时（2 秒）——代码疑似死循环')), 2000)),
-    ])
-    if (!inst || typeof inst !== 'object') return 'create(api) 没有返回对象'
-    if (registered.length === 0) return 'create(api) 里没有调用 api.tools.add 注册任何工具——AI 调不到这个能力，器官等于不存在'
-    for (const def of registered) {
-      if (!def || !def.name) return 'api.tools.add 的工具缺 name'
-      if (typeof def.execute !== 'function') return `工具 ${def.name} 缺 execute 函数`
-    }
-  } catch (e) {
-    return '加载失败：' + e.message
-  }
-  return null
+    const timer = setTimeout(() => finish('加载超时（4 秒）——代码疑似死循环'), 4000)
+    timer.unref?.()
+    worker.on('message', (msg) => {
+      if (!msg || typeof msg !== 'object') return
+      if (msg.type === 'ok') finish(null)
+      else if (msg.type === 'fail') finish('加载失败：' + String(msg.error || '干跑失败'))
+    })
+    worker.on('error', (error) => finish('加载失败：' + error.message))
+    worker.on('exit', (exitCode) => finish('加载失败：干跑进程提前退出（code=' + exitCode + '）'))
+  })
 }
 
 async function generate(dsh, getConfig, gapText, lastError) {

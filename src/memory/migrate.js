@@ -5,7 +5,7 @@
 //     已迁过（id 已在 store）的就跳过，所以重复跑只补增量、不重复。
 //   - profiles / insights / styles → mem/archive.json（硬档：人物小档案 + 相处经验 + 说话方式）。
 //   - 不删 memories.json（旧 memory.js 还在跑，Slice 3/4 切完后才退休改名 .bak）。
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, numOr, readJson, writeJson, withFileLock } from '../core/store.js'
 import { isHardFact } from './similar.js'
 
 const SRC_MAP = {
@@ -24,7 +24,7 @@ export function migrateLegacy({ store, log = console } = {}) {
   for (const it of legacy.items || []) {
     if (existing.has(it.id)) continue
     const src = SRC_MAP[it.source] || 'inferred'
-    const conf = Math.max(0, Math.min(1, Number(it.importance) ?? 0.5))
+    const conf = Math.max(0, Math.min(1, numOr(it.importance, 0.5)))
     const text = String(it.text || '').trim()
     if (!text) continue
     store.addFact({

@@ -6,6 +6,7 @@
 //
 // 判重 0.85 + 实体/否定词保护在 similar.js；命中只 bumpHit、不动 t0。
 import { askModel } from '../core/llm.js'
+import { numOr } from '../core/store.js'
 import { OWNER_ID } from '../chat/access.js'
 import { isDup, isHardFact } from './similar.js'
 
@@ -130,14 +131,14 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
       const id = String(x.about_id ?? '').trim()
       const subj = /^[a-z][\w-]*$/.test(id) ? id : (chatId && chatId !== 'azone' ? chatId : '')
       const src = ['told', 'inferred', 'self_did', 'imagined'].includes(String(x.src)) ? String(x.src) : 'inferred'
-      const conf = Math.max(0, Math.min(1, Number(x.conf) ?? 0.5))
+      const conf = Math.max(0, Math.min(1, numOr(x.conf, 0.5)))
 
       const op = String(x.op || 'add')
       const targetId = String(x.id || '').replace(/^#/, '')
       const target = targetId ? store.findFact(targetId) : null
 
       if ((op === 'update' || op === 'outdated') && target) {
-        const nf = store.supersede(target.id, { text, subj: subj || target.subj, aboutName: x.about || target.aboutName || '', src, conf, chatId, archived: isHardFact({ text, src, conf }) })
+        const nf = await store.supersede(target.id, { text, subj: subj || target.subj, aboutName: x.about || target.aboutName || '', src, conf, chatId, archived: isHardFact({ text, src, conf }) })
         superseded++
         supersededIds.push(nf.id)
         log.info(`记忆更新：「${target.text.slice(0, 40)}」→「${text.slice(0, 40)}」(${op})`)
@@ -147,7 +148,7 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
       // add：先判重（0.85 + 实体/否定词保护）
       const dup = nowFacts.find((f) => isDup({ text, subj }, f))
       if (dup) {
-        store.bumpHit(dup.id)
+        await store.bumpHit(dup.id)
         skipped++
         continue
       }
@@ -193,7 +194,7 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
         salience: 0.5,
       })
       // 证据链：这段事件里抽到的事实挂到本 episode（情绪锚点召回靠 ev → episode.moodOut）
-      for (const fid of [...(r.addedIds || []), ...(r.supersededIds || [])]) store.linkEvidence(fid, ep.id)
+      for (const fid of [...(r.addedIds || []), ...(r.supersededIds || [])]) await store.linkEvidence(fid, ep.id)
       episodes.push(ep)
     }
     return { episodes, facts: { added, superseded, addedIds, supersededIds } }

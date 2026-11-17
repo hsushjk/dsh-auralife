@@ -16,6 +16,13 @@ export function dataDir(...segments) {
   return join(pluginDataBase(), ...segments)
 }
 
+// 数字兜底：Number(x) ?? 默认值 挡不住 NaN（NaN 不是 nullish），
+// 缺字段/脏数据时会算出 NaN 并一路污染排序与持久化。统一用这个。
+export function numOr(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
 export function ensureDir(target) {
   mkdirSync(target, { recursive: true })
   return target
@@ -64,39 +71,48 @@ export { existsSync }
 // —— 跨进程互斥锁——
 // DSH 会为每个会话进程各加载一份插件，同一批数据文件会被多个进程同时「读-改-写」。
 // 锁实现：locks/<name>.lock.json 的原子创建（openSync 的 'wx' 模式：文件已存在必失败，跨平台原子）。
-// 持有者把 {pid, at} 写进锁文件；崩溃没释放的锁超过 staleMs 会被下一位抢占。
-// fn 同步则同步执行；fn 返回 Promise 则锁一直持有到它落定（长任务如记忆整理需要这样）。
+// 持有者把 {pid, at, token} 写进锁文件；崩溃没释放的锁超过 staleMs 会被下一位抢占。
+// 等锁用 await sleep 让出事件循环（同步自旋 Atomics.wait 会把整个 DSH 进程卡住几秒）。
+// fn 可以是同步函数也可以是 async 函数：返回值原样返回，抛错原样抛出，
+// 但无论走哪条路，心跳 interval 和锁文件都在 finally 里释放。
 const lockFileFor = (name) => dataDir('locks', `${name}.lock.json`)
-const pauseSync = (ms) => {
-  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch {
-    const until = Date.now() + ms
-    while (Date.now() < until) { /* 无 Atomics 环境的忙等兜底 */ }
+const lockSleep = (ms) => new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, ms)); t.unref?.() })
+
+// 抢一次锁：成功返回 fd；被别的进程持有返回 null（顺手清掉超过 staleMs 的僵尸锁）。
+function tryAcquireFileLock(lockFile, staleMs) {
+  try {
+    return openSync(lockFile, 'wx')
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err
+    try {
+      const owner = JSON.parse(readFileSync(lockFile, 'utf8'))
+      const abandoned = !owner || Date.now() - (owner.at || 0) > staleMs
+      if (abandoned) unlinkSync(lockFile)
+    } catch {
+      try { unlinkSync(lockFile) } catch { /* 别人刚好拿走 */ }
+    }
+    return null
   }
 }
 
-export function withFileLock(name, fn, opts = {}) {
+export async function withFileLock(name, fn, opts = {}) {
   const { staleMs = 15000, timeoutMs = 8000, spinMs = 15 } = opts
   const lockFile = lockFileFor(name)
   const giveUpAt = Date.now() + timeoutMs
   const token = `${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
   ensureDir(dirname(lockFile))
   let fd = null
+  let waitMs = spinMs
   for (;;) {
-    if (Date.now() > giveUpAt) {
+    fd = tryAcquireFileLock(lockFile, staleMs)
+    if (fd !== null) break
+    const left = giveUpAt - Date.now()
+    if (left <= 0) {
       throw new Error(`withFileLock: 拿不到锁 ${name}（${Math.round(timeoutMs / 1000)} 秒超时，可能别的进程卡死）`)
     }
-    try {
-      fd = openSync(lockFile, 'wx')
-      break
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err
-      try {
-        const owner = JSON.parse(readFileSync(lockFile, 'utf8'))
-        const abandoned = !owner || Date.now() - (owner.at || 0) > staleMs
-        if (abandoned) unlinkSync(lockFile)
-      } catch { try { unlinkSync(lockFile) } catch { /* 别人刚好拿走 */ } }
-      pauseSync(spinMs)
-    }
+    // 关键：异步等锁。以前是 Atomics.wait 同步自旋，一次锁冲突能冻住整个事件循环 8 秒。
+    await lockSleep(Math.min(waitMs, left))
+    waitMs = Math.min(250, Math.round(waitMs * 1.8))
   }
   try {
     writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now(), token }), 'utf8')
@@ -112,17 +128,13 @@ export function withFileLock(name, fn, opts = {}) {
     }, Math.max(500, Math.floor(staleMs / 3)))
     try { heart.unref?.() } catch { /* 无所谓 */ }
   }
-  const release = () => {
+  try {
+    return await fn()
+  } finally {
     if (heart) clearInterval(heart)
     try {
       const owner = JSON.parse(readFileSync(lockFile, 'utf8'))
       if (owner && owner.token === token) unlinkSync(lockFile)
     } catch { /* 已释放 */ }
   }
-  const result = fn()
-  if (result && typeof result.then === 'function') {
-    return result.then((v) => { release(); return v }, (e) => { release(); throw e })
-  }
-  release()
-  return result
 }

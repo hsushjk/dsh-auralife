@@ -45,11 +45,30 @@ export function register(router, ctx) {
     if (organHost && typeof organHost.refreshIfChanged === 'function') {
       try { await organHost.refreshIfChanged() } catch (error) {}
     }
+    // 只回传可序列化字段：内存条目里挂着 worker 运行时（Wire 对象）和执行函数，不能直接 JSON.stringify。
+    const organs = (organHost ? organHost.list() : []).map((o) => ({
+      id: o.id,
+      name: o.name,
+      description: o.description,
+      status: o.status,
+      source: o.source,
+      capabilities: Array.isArray(o.capabilities) ? o.capabilities : [],
+      settings: Array.isArray(o.settings) ? o.settings : [],
+      tools: Array.isArray(o.toolDefs) ? o.toolDefs.map((d) => d && d.name).filter(Boolean) : [],
+    }))
     return json(res, {
       ok: true,
-      organs: organHost ? organHost.list() : [],
+      organs,
       capabilities: organHost ? organHost.capabilities() : [],
     })
+  })
+
+  // 器官审计（动作流水：加载/卸载/工具/联网/读写/借模型/自举。事后定位「谁的器官动过什么」）
+  router.add('GET', 'api/organs/audit', async (req, res) => {
+    const me = requireOwner(req, res); if (!me) return
+    if (!organHost || !organHost.audit) return json(res, { ok: false, message: '器官审计未就绪' })
+    const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 100))
+    return json(res, { ok: true, entries: organHost.audit.list({ limit }) })
   })
 
   // 器官设置（meta.settings 声明式设置：读/写落在该器官自己的目录，器官代码用 api.store 读写）
@@ -71,7 +90,7 @@ export function register(router, ctx) {
     const org = String(b.org || '')
     if (!organHost.list().some((o) => o.id === org)) return json(res, { ok: false, message: '没有这个器官' })
     ensureDir(dataDir('organs', 'self-made', org))
-    withFileLock(`organ-cfg-${org}`, () => {
+    await withFileLock(`organ-cfg-${org}`, () => {
       writeJson(dataDir('organs', 'self-made', org, 'cfg.json'), b.values || {})
     }, { staleMs: 10000, timeoutMs: 5000 })
     return json(res, { ok: true })

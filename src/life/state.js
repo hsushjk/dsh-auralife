@@ -74,10 +74,11 @@ export function createLife({ getConfig, log }) {
 
   // 跨进程「读-改-写」：DSH 每个进程都跑一份插件（多进程各自 tick），直接 load→改→save 会互相覆盖。
   // update() 在文件锁里重新读盘、应用改动、写回——所有改 state 的入口都走它（审计发现的最高风险点）。
-  function update(fn) {
-    return withFileLock('state', () => {
+  // update() 在文件锁里重新读盘、应用改动、写回；fn 允许 async（内部要 await 别的异步操作时用）。
+  async function update(fn) {
+    return withFileLock('state', async () => {
       const s = load()
-      const out = fn(s)
+      const out = await fn(s)
       save(s)
       return out
     })

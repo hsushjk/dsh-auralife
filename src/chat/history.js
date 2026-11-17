@@ -178,7 +178,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return msg
   }
 
-  function append(chatId, payload) {
+  async function append(chatId, payload) {
     // 多进程下 DSH 每个进程都跑一份插件，append/patchLast 的读-改-写必须进锁，否则并发丢消息。
     return withFileLock(`hist-${chatId}`, () => {
       const msg = extractMedia(chatId, { id: randomUUID(), t: Date.now(), ...payload })
@@ -212,7 +212,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return data
   }
 
-  function patchLast(chatId, patch) {
+  async function patchLast(chatId, patch) {
     return withFileLock(`hist-${chatId}`, () => {
       const idx = readIndex(chatId)
       const seg = idx.segments[idx.segments.length - 1]

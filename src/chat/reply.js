@@ -92,8 +92,32 @@ function lineWorthKeeping(line) {
   return true
 }
 
+// 残留的协议标签（未配对成功时）不该出现在聊天正文里。
+const STRAY_TAG_RE = /<voice>|<\/voice>|<file:[^<>]*>|<\/file>|<sticker:[^<>]*>|<\/sticker>|<poke\s*\/?>/gi
+
+function stripStrayTags(text) {
+  return String(text || '').replace(STRAY_TAG_RE, '')
+}
+
+// 未闭合标记：模型有时忘记写结束标签（`<voice>我就是想你了`、`<file:a.txt>hello`）。
+// 从左到右找「开了没关」的那个标签，把它到行尾的内容当成完整的项。
+const UNCLOSED_VOICE_RE = /<voice>((?:(?!<\/voice>)[\s\S])*)$/i
+const UNCLOSED_FILE_RE = /<file:([^<>]+?)>((?:(?!<\/file>)[\s\S])*)$/i
+
+function takeUnclosed(text) {
+  const voice = UNCLOSED_VOICE_RE.exec(text)
+  const file = UNCLOSED_FILE_RE.exec(text)
+  const candidates = []
+  if (voice) candidates.push({ index: voice.index, kind: 'voice', value: voice[1] })
+  if (file) candidates.push({ index: file.index, kind: 'file', name: file[1].trim(), value: file[2] })
+  if (!candidates.length) return null
+  candidates.sort((a, b) => a.index - b.index)
+  const first = candidates[0]
+  return { before: text.slice(0, first.index), item: first }
+}
+
 function textToItems(value) {
-  const cleaned = stripMarkdown(String(value || '').replace(/<\/?reply[^>]*>/g, ''))
+  const cleaned = stripMarkdown(stripStrayTags(String(value || '').replace(/<\/?reply[^>]*>/g, '')))
   if (!cleaned || isSilence(cleaned)) return []
   const lines = splitLines(cleaned)
   return lines.filter(lineWorthKeeping).map((line) => ({ kind: 'text', value: line }))
@@ -144,7 +168,19 @@ export function parseReply(text) {
       consumed = MARKER_RE.lastIndex
     }
     const tail = items.length
-    items.push(...textToItems(segment.slice(consumed)))
+    const tailText = segment.slice(consumed)
+    const unclosed = takeUnclosed(tailText)
+    if (unclosed) {
+      items.push(...textToItems(unclosed.before))
+      const content = stripMarkdown(stripStrayTags(unclosed.item.value)).trim()
+      if (unclosed.item.kind === 'voice') {
+        if (content) items.push({ kind: 'voice', value: content })
+      } else if (content) {
+        items.push({ kind: 'file', value: content, name: unclosed.item.name })
+      }
+    } else {
+      items.push(...textToItems(tailText))
+    }
     attachPending(tail)
   }
 

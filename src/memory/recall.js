@@ -11,6 +11,7 @@
 // 与旧 memory.js 的 search/contextFor 不同：这里只读 mem store（facts/episodes），
 // 不含 profiles/insights/styles（那些是「人格/相处经验」，Slice 4 另管）。
 import { tokenize } from './similar.js'
+import { numOr } from '../core/store.js'
 
 const HOUR_LABEL = (h) => {
   if (h < 6) return '凌晨'
@@ -41,7 +42,7 @@ export function recallability(f, now = Date.now()) {
   const last = Math.max(f.t0 || 0, f.lastHit || 0)
   const days = Math.max(0, (now - last) / 86400_000)
   const strength = 1 + Math.min(10, Number(f.hitDays) || 0)
-  const tau = 20 * strength * (0.5 + (Number(f.conf) ?? 0.5))
+  const tau = 20 * strength * (0.5 + numOr(f.conf, 0.5))
   return Math.exp(-days / tau)
 }
 
@@ -101,7 +102,7 @@ export function createRecall({ store, getConfig, log = console }) {
       const base = s + (aboutHit ? 1.2 : 0)
       // 应激注意力倾斜（continuous，见 attentionMultiplier）：皮质醇越高，硬档越浮、日常越沉。
       const att = attentionMultiplier(cue.cortisol, f.archived)
-      const score = base * recallability(f, cue.now) * (0.7 + 0.3 * (Number(f.conf) ?? 0.5)) * (f.archived ? 1.3 : 1) * att
+      const score = base * recallability(f, cue.now) * (0.7 + 0.3 * numOr(f.conf, 0.5)) * (f.archived ? 1.3 : 1) * att
       scored.push({ f, score, bm25: s, aboutHit })
     }
     scored.sort((a, b) => b.score - a.score)
@@ -113,7 +114,7 @@ export function createRecall({ store, getConfig, log = console }) {
     const pickedIds = new Set(picked.map((x) => x.f.id))
     const cold = facts
       .filter((f) => !pickedIds.has(f.id) && (Number(f.hitDays) || 0) <= 1)
-      .filter((f) => (cue.about ? f.subj === cue.about : true) || (Number(f.conf) ?? 0) >= 0.5)
+      .filter((f) => (cue.about ? f.subj === cue.about : true) || numOr(f.conf, 0) >= 0.5)
       .sort((a, b) => (a.lastHit || 0) - (b.lastHit || 0))
       .slice(0, count)
     return cold.map((f) => ({ f, score: 0.05, bm25: 0, aboutHit: false, cold: true }))
@@ -167,16 +168,16 @@ export function createRecall({ store, getConfig, log = console }) {
     const budget = Number(cfg().maxContextChars) || 3000
     const now = cue.now
 
-    const tier = (f) => (f.archived ? '硬档' : (Number(f.conf) ?? 0) >= 0.6 ? '印象' : '模糊')
+    const tier = (f) => (f.archived ? '硬档' : numOr(f.conf, 0) >= 0.6 ? '印象' : '模糊')
     const lineOf = (f) => {
       const days = Math.max(0, Math.round((now - (f.t0 || now)) / 86400_000))
-      const conf = Math.round((Number(f.conf) ?? 0.5) * 10) / 10
+      const conf = Math.round(numOr(f.conf, 0.5) * 10) / 10
       const nm = f.aboutName ? `[${f.aboutName}] ` : ''
       return `[${tier(f)}] [第${days}天·信度${conf}] ${nm}${f.text}`
     }
 
     // 先塞硬档/印象（高可信），再塞事件（最近做过的事），最后模糊
-    const order = (x) => (x.f.archived ? 0 : (Number(x.f.conf) ?? 0) >= 0.6 ? 1 : 2)
+    const order = (x) => (x.f.archived ? 0 : numOr(x.f.conf, 0) >= 0.6 ? 1 : 2)
     for (const x of [...scored].sort((a, b) => order(a) - order(b))) {
       if (used.has(x.f.id)) continue
       const line = lineOf(x.f)
@@ -216,7 +217,7 @@ export function createRecall({ store, getConfig, log = console }) {
     for (const x of picked) {
       const f = x.f
       const sameDay = f.lastHit ? new Date(f.lastHit).toDateString() === new Date(cue.now).toDateString() : false
-      if (!sameDay) store.bumpHit(x.f.id, cue.now)
+      if (!sameDay) store.bumpHit(x.f.id, cue.now).catch((error) => log.warn('记忆召回计数写失败：' + (error?.message || error)))
     }
 
     const { lines, chars } = format(picked, cue)

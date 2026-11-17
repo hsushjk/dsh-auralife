@@ -1,4 +1,4 @@
-// 器官宿主（organ-host）：数字生命的「能力清单」+ 器官加载器。
+// 器官宿主（organ-host）：数字生命的「能力清单」+ 器官加载器 + 运行时隔离层。
 //
 // 定位：一个统一层，让 Ta（LLM）知道「自己会什么、不会什么」。
 // - register(meta)：登记内置器官（host.js 装配时调用）。
@@ -7,16 +7,24 @@
 // - loadSelfMade()：扫描数据目录 organs/self-made/ 热加载 Ta 自己写的器官。
 //
 // 器官自举链路（全 AI 托管，无人工审批）：gap 检测到缺口 → 判断「清单里没有能解决这事的器官」
-// → LLM 生成器官（meta + 受控代码）→ guardOrgan 静态检查 + 四重干跑 → 落盘 status=active
-// → host.js 立刻 loadSelfMade 动态 import + create(api) 热加载。
-// （曾经有 pending/主人批准机制，但 DSH agent 本身有 shell/文件工具，批准只是假动作，
-// 所以取消人工审批。防线 = 四重验证 + apiFor 白名单 + tick 熔断 + 磁盘热卸载。）
+// → LLM 生成器官（meta + 受控代码）→ guardOrgan 静态检查 + worker 干跑 → 落盘 status=active
+// → host.js 立刻 loadSelfMade 热加载。
+//
+// 安全模型（DSH agent 本身有 shell/文件工具，所以「人工审批」是假动作，已取消）：
+// 1. guardOrgan 静态闸：拒绝 require/process/动态 import/全局 fetch/原型链逃逸等（提高门槛，不是唯一防线）；
+// 2. worker_threads 运行时隔离：每个 self-made 器官一个独立 Worker，死循环/process.exit/崩溃只杀自己，
+//    宿主靠加载/调用超时兜底并 terminate，连续失败熔断；
+// 3. Worker 内白名单 api：器官只能通过 log/net/store/llm/tools 做事，作用域里不注入宿主对象；
+//    联网出口有 SSRF 过滤（禁 localhost/私网），store 键名受限；
+// 4. 审计：加载/卸载/工具/联网/读写/借模型全部写 organs/audit.jsonl，出问题能定位和关停。
 
 import { readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { Worker } from 'node:worker_threads'
 import { dataDir, readJson, writeJson, ensureDir, existsSync, withFileLock } from '../core/store.js'
 import { guardOrgan } from './organ-guard.js'
+import { createOrganAudit, clip } from './organ-audit.js'
 import { askModel } from '../core/llm.js'
 
 export const BUILTIN_ORGANS = [
@@ -98,9 +106,16 @@ export const BUILTIN_ORGANS = [
 
 const selfMadeDir = () => dataDir('organs', 'self-made')
 
+// Worker 生命周期超时：加载/干跑卡死时宿主靠这些兜底 terminate。
+const READY_TIMEOUT_MS = 15000
+const TICK_TIMEOUT_MS = 10000
+const TOOL_TIMEOUT_MS = 15000
+
 export function createOrganHost({ dsh, getConfig, log }) {
   const logger = log
   const organs = new Map()
+  const audit = createOrganAudit({ log: logger })
+  const trips = new Map()
 
   const register = (meta) => {
     organs.set(meta.id, { ...meta, status: 'active', source: 'builtin' })
@@ -149,50 +164,212 @@ export function createOrganHost({ dsh, getConfig, log }) {
     return directives.length ? [head, ...directives].join('\n') : head
   }
 
-  // 白名单 API：器官代码里拿不到 fs/process/globalThis，只能拿这几个受控入口。
-  // 主人批准 = 信任，所以给足「软能力」：llm.ask 让器官可以借模型的脑子做判断/翻译/总结，
-  // 而不是只能硬编码规则（这正是 AI 造废器官的头号原因——它想造"聪明"器官却只拿到 net/store）。
-  const apiFor = (id) => ({
-    log: (typeof logger.child === 'function') ? logger.child(`organ:${id}`) : logger,
-    net: {
-      async fetchText(url, opts = {}) {
-        if (!/^https?:\/\//i.test(url)) throw new Error('只允许 http/https 地址')
-        const res = await fetch(url, { signal: AbortSignal.timeout(opts.timeoutMs || 15000), ...(opts.init || {}) })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        return res.text()
-      },
-      async fetchJson(url, opts = {}) {
-        return JSON.parse(await this.fetchText(url, opts))
-      },
-    },
-    store: {
-      get: (key, fallback) => readJson(dataDir('organs', id, `${key}.json`), fallback),
-      set: (key, value) => withFileLock(`organ-store-${id}`, () => {
-        ensureDir(dataDir('organs', id))
-        writeJson(dataDir('organs', id, `${key}.json`), value)
-      }, { staleMs: 10000, timeoutMs: 5000 }),
-    },
-    // 注册工具：器官的能力要能被 AI 真正调到，不只是出现在能力清单里。
-    tools: {
-      add(def) {
-        const o = organs.get(id)
-        if (!o) return null
-        if (!o.toolDefs) o.toolDefs = []
-        o.toolDefs.push(def)
-        return def.name
-      },
-    },
-    // 借模型的脑子：器官可以调 LLM 做软逻辑（判断/翻译/总结/解析）。
-    llm: {
-      ask(prompt, opts = {}) {
-        return askModel(dsh, {
-          cfg: getConfig(),
-          system: String(opts.system || ''),
-          text: String(prompt || ''),
-          maxTokens: Number(opts.maxTokens) || 800,
-          temperature: opts.temperature === undefined ? 0.3 : Number(opts.temperature),
-        })
-      },
+  // ---- 宿主侧 RPC：worker 里器官发起的白名单调用，全部在这里执行 + 审计 ----
+
+  const privateHostError = (url) => {
+    let u
+    try { u = new URL(String(url)) } catch { return '地址不合法' }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '只允许 http/https 地址'
+    const h = String(u.hostname || '').replace(/^\[|\]$/g, '').toLowerCase()
+    if (!h) return '地址不合法'
+    if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.lan')) return '禁止访问本机/内网地址'
+    if (h === '::1' || h === '0.0.0.0' || h === '::') return '禁止访问本机/内网地址'
+    if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h)) return '禁止访问本机/内网地址'
+    if (/^100\.(6[4-9]|[7-9]\d|1[0-1]\d|12[0-7])\./.test(h)) return '禁止访问本机/内网地址'
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return '禁止访问本机/内网地址'
+    if (/^::ffff:/i.test(h) || /^fe80:/i.test(h) || /^f[cd]/i.test(h)) return '禁止访问本机/内网地址'
+    return null
+  }
+
+  const runRpc = async (organId, method, args) => {
+    const a = args || {}
+    if (method === 'log') {
+      const level = ['info', 'warn', 'error', 'debug'].includes(a.level) ? a.level : 'info'
+      const fn = logger[level] || logger.info
+      fn(String(a.message || ''))
+      return true
+    }
+    if (method === 'net.fetchText' || method === 'net.fetchJson') {
+      const bad = privateHostError(a.url)
+      if (bad) {
+        audit.append({ event: 'net_blocked', organ: organId, url: clip(a.url, 200), reason: bad })
+        throw new Error(bad)
+      }
+      audit.append({ event: 'net', organ: organId, url: clip(a.url, 200) })
+      const timeoutMs = Math.max(1000, Math.min(120000, Number(a.opts?.timeoutMs) || 15000))
+      const res = await fetch(String(a.url), { signal: AbortSignal.timeout(timeoutMs) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const text = await res.text()
+      return method === 'net.fetchJson' ? JSON.parse(text) : text
+    }
+    if (method === 'store.get') {
+      return readJson(dataDir('organs', organId, `${String(a.key || '')}.json`), a.fallback ?? null)
+    }
+    if (method === 'store.set') {
+      const key = String(a.key || '')
+      if (!key || key.includes('/') || key.includes('\\') || key.includes('..')) {
+        throw new Error('store key 不合法（不允许路径分隔符）')
+      }
+      await withFileLock(`organ-store-${organId}`, () => {
+        ensureDir(dataDir('organs', organId))
+        writeJson(dataDir('organs', organId, `${key}.json`), a.value ?? null)
+      }, { staleMs: 10000, timeoutMs: 5000 })
+      audit.append({ event: 'store', organ: organId, key, value: clip(a.value, 200) })
+      return { ok: true }
+    }
+    if (method === 'llm.ask') {
+      audit.append({ event: 'llm', organ: organId, prompt: clip(a.prompt, 200) })
+      return askModel(dsh, {
+        cfg: getConfig(),
+        system: String(a.opts?.system || ''),
+        text: String(a.prompt || ''),
+        maxTokens: Number(a.opts?.maxTokens) || 800,
+        temperature: a.opts?.temperature === undefined ? 0.3 : Number(a.opts.temperature),
+        preferLowEffort: true,
+      })
+    }
+    throw new Error(`不认识的 RPC：${method}`)
+  }
+
+  // ---- Worker 运行时管理 ----
+
+  const rejectPending = (rt, error) => {
+    for (const p of rt.pending.values()) {
+      try { p.reject(error) } catch { /* 已 settle */ }
+    }
+    rt.pending.clear()
+  }
+
+  const failRuntime = (rt, error, reason) => {
+    if (!rt || rt.failed) return
+    rt.failed = true
+    rt.stopped = true
+    const err = error instanceof Error ? error : new Error(String(error))
+    if (rt.onReadyError) {
+      const f = rt.onReadyError
+      rt.onReadyError = null
+      rt.onReady = null
+      try { f(err) } catch { /* 已 settle */ }
+    }
+    rejectPending(rt, err)
+    try { rt.worker.terminate() } catch { /* 已退出 */ }
+    audit.append({ event: 'worker_fail', organ: rt.id, reason, error: clip(err.message) })
+  }
+
+  const safeSend = (rt, payload) => {
+    try { rt.worker.postMessage(payload) } catch (error) {
+      failRuntime(rt, error, 'postMessage')
+    }
+  }
+
+  const onRuntimeMessage = (rt, msg) => {
+    if (!msg || typeof msg !== 'object') return
+    if (msg.type === 'ready') {
+      if (rt.onReady) {
+        const f = rt.onReady
+        rt.onReady = null
+        rt.onReadyError = null
+        f(msg)
+      }
+      return
+    }
+    if (msg.type === 'initError') {
+      failRuntime(rt, new Error(msg.error || '器官初始化失败'), 'init')
+      return
+    }
+    if (msg.type === 'rpc') {
+      runRpc(rt.id, msg.method, msg.args)
+        .then((value) => safeSend(rt, { type: 'rpcResult', callId: msg.callId, ok: true, value: value === undefined ? null : value }))
+        .catch((error) => safeSend(rt, { type: 'rpcResult', callId: msg.callId, ok: false, error: String(error?.message || error) }))
+      return
+    }
+    const p = rt.pending.get(msg.callId)
+    if (!p) return
+    rt.pending.delete(msg.callId)
+    if (!msg.ok) {
+      p.reject(new Error(String(msg.error || '器官调用失败')))
+      return
+    }
+    if (msg.type === 'tickResult' && typeof msg.contextLine === 'string') rt.contextLine = msg.contextLine
+    p.resolve(msg.value)
+  }
+
+  const callWorker = (rt, message, timeoutMs) => new Promise((resolve, reject) => {
+    if (rt.failed || rt.stopped) {
+      reject(new Error('器官进程已停止'))
+      return
+    }
+    const callId = ++rt.seq
+    const timer = setTimeout(() => {
+      rt.pending.delete(callId)
+      failRuntime(rt, new Error(`器官 ${rt.id} 调用超时（${Math.round(timeoutMs / 1000)} 秒）`), 'timeout')
+      reject(new Error(`器官 ${rt.id} 调用超时（${Math.round(timeoutMs / 1000)} 秒）`))
+    }, timeoutMs)
+    timer.unref?.()
+    rt.pending.set(callId, {
+      resolve: (v) => { clearTimeout(timer); resolve(v) },
+      reject: (e) => { clearTimeout(timer); reject(e) },
+    })
+    safeSend(rt, { ...message, callId })
+  })
+
+  const startRuntime = (manifest, indexPath) => {
+    const rt = {
+      id: String(manifest.id),
+      worker: null,
+      pending: new Map(),
+      seq: 0,
+      toolDescs: [],
+      contextLine: '',
+      failed: false,
+      stopped: false,
+      onReady: null,
+      onReadyError: null,
+      readyTimer: null,
+    }
+    const worker = new Worker(new URL('./organ-worker.js', import.meta.url), {
+      workerData: { url: pathToFileURL(indexPath).href + '?t=' + Date.now(), id: rt.id },
+    })
+    rt.worker = worker
+    worker.on('message', (msg) => onRuntimeMessage(rt, msg))
+    worker.on('error', (error) => failRuntime(rt, error, 'crash'))
+    worker.on('exit', (code) => {
+      if (rt.stopped || rt.failed) return
+      failRuntime(rt, new Error(`器官进程退出（code=${code}）`), 'exit')
+    })
+    const ready = new Promise((resolve, reject) => {
+      rt.onReady = (msg) => resolve(msg)
+      rt.onReadyError = (err) => reject(err)
+      rt.readyTimer = setTimeout(() => {
+        failRuntime(rt, new Error('器官加载超时（15 秒，疑似死循环/卡死）'), 'ready-timeout')
+      }, READY_TIMEOUT_MS)
+      rt.readyTimer.unref?.()
+    }).finally(() => {
+      if (rt.readyTimer) clearTimeout(rt.readyTimer)
+    })
+    return { rt, ready }
+  }
+
+  const stopRuntime = (rt, reason = 'stopped') => {
+    if (!rt || rt.stopped) return
+    rt.stopped = true
+    try { rt.worker.postMessage({ type: 'shutdown' }) } catch { /* 已退出 */ }
+    const t = setTimeout(() => {
+      try { rt.worker.terminate() } catch { /* 已退出 */ }
+    }, 100)
+    t.unref?.()
+    rejectPending(rt, new Error('器官已停止'))
+    audit.append({ event: 'stop', organ: rt.id, reason })
+  }
+
+  const toolDefFor = (rt, desc) => ({
+    name: String(desc.name),
+    description: String(desc.description || ''),
+    properties: (desc.properties && typeof desc.properties === 'object') ? desc.properties : {},
+    required: Array.isArray(desc.required) ? desc.required : [],
+    async execute(args) {
+      audit.append({ event: 'tool', organ: rt.id, tool: String(desc.name), args: clip(args) })
+      return callWorker(rt, { type: 'toolCall', name: String(desc.name), args: args || {} }, TOOL_TIMEOUT_MS)
     },
   })
 
@@ -205,21 +382,24 @@ export function createOrganHost({ dsh, getConfig, log }) {
     return out
   }
 
-  // 扫描 self-made 目录：全 AI 托管，磁盘上有的器官一律热加载（无 pending/批准）。
-  // guard 拦住的 warn 跳过；create 抛错/没注册工具的 warn 跳过（bootstrap 落盘前已四重验证，这里是最后防线）。
+  // 扫描 self-made 目录：全 AI 托管，磁盘上有的器官一律热加载。
+  // self-made 器官跑在独立 Worker 里：加载失败/死循环/process.exit 只影响它自己。
   const loadSelfMade = async () => {
     const dir = selfMadeDir()
-    // 热卸载：磁盘上已不存在的 self-made 器官（被 AI 卸载/手动删除）要从内存清单清掉。
-    // 此前只增不减——一个进程删目录后，其他进程的幽灵条目永远留着，
-    // AI 上下文里还写着「你有这个能力」，实际器官已没了。
     const diskIds = new Set()
     if (existsSync(dir)) {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.isDirectory()) diskIds.add(entry.name)
       }
     }
+    // 热卸载：磁盘上已不存在的 self-made 器官要从内存清单清掉，并停掉它的 worker。
     for (const [id, o] of [...organs]) {
-      if (o.source === 'self-made' && !diskIds.has(id)) organs.delete(id)
+      if (o.source === 'self-made' && !diskIds.has(id)) {
+        if (o.runtime) stopRuntime(o.runtime, 'unloaded')
+        organs.delete(id)
+        trips.delete(id)
+        audit.append({ event: 'unload', organ: id, reason: 'disk-removed' })
+      }
     }
     if (!existsSync(dir)) return []
     const loaded = []
@@ -231,44 +411,61 @@ export function createOrganHost({ dsh, getConfig, log }) {
       if (!existsSync(manifestPath) || !existsSync(indexPath)) continue
       const manifest = readJson(manifestPath, null)
       if (!manifest || !manifest.id) continue
-      // 幂等：已热加载的 active 器官跳过（bootstrap 落盘后、refreshIfChanged 重扫都会再调 loadSelfMade，
-      // 重复 import 会重复 create + 重复注册工具）。
+      // 幂等：已热加载且 worker 活着的 active 器官跳过。
       const existing = organs.get(manifest.id)
-      if (existing && existing.status === 'active' && existing.instance) continue
+      if (existing && existing.status === 'active' && existing.instance && !(existing.runtime && existing.runtime.failed)) continue
+      if (existing && existing.runtime) stopRuntime(existing.runtime, 'reload')
       const code = readFileSync(indexPath, 'utf8')
       const g = guardOrgan(code)
       if (!g.ok) {
         logger.warn(`器官 ${manifest.id} 被 guard 拦截：${g.problems.join('、')}`)
+        audit.append({ event: 'guard_block', organ: manifest.id, problems: g.problems })
         continue
       }
       try {
-        const url = pathToFileURL(indexPath).href + '?t=' + Date.now()
-        const mod = await import(url)
-        const meta = mod.meta || manifest
-        const prev = organs.get(meta.id)
-        // 先占位再 create：apiFor 的 tools.add 靠 organs.get(id) 找落点，
-        // 首次加载时 Map 里还没有该条目 → 不占位的话 create(api) 期间注册的工具全部静默丢失。
-        organs.set(meta.id, { ...meta, status: 'active', source: 'self-made', module: mod, instance: null, toolDefs: (prev && prev.toolDefs) || [] })
-        const instance = typeof mod.create === 'function' ? await mod.create(apiFor(meta.id)) : {}
-        // create(api) 期间 tools.add 往占位条目 push 工具定义；覆盖时要保留的是「占位后」的 toolDefs。
-        const cur = organs.get(meta.id)
-        organs.set(meta.id, { ...meta, status: 'active', source: 'self-made', module: mod, instance, toolDefs: (cur && cur.toolDefs) || [] })
-        loaded.push(meta.id)
+        const { rt, ready } = startRuntime(manifest, indexPath)
+        const info = await ready
+        const meta = { ...manifest, ...(info.meta || {}) }
+        const id = String(meta.id || manifest.id)
+        rt.id = id
+        rt.toolDescs = Array.isArray(info.tools) ? info.tools : []
+        rt.contextLine = String(info.contextLine || '')
+        const defs = rt.toolDescs.map((desc) => toolDefFor(rt, desc))
+        const instance = {
+          contextLine: () => rt.contextLine,
+          tick: async () => {
+            return callWorker(rt, { type: 'tick' }, TICK_TIMEOUT_MS)
+          },
+        }
+        const prev = organs.get(id)
+        organs.set(id, {
+          ...meta,
+          id,
+          status: 'active',
+          source: 'self-made',
+          instance,
+          runtime: rt,
+          toolDefs: (prev && Array.isArray(prev.toolDefs) && prev.toolDefs.length ? prev.toolDefs : defs),
+        })
+        trips.delete(id)
+        loaded.push(id)
+        audit.append({ event: 'load', organ: id, name: meta.name, tools: defs.map((d) => d.name), gap: clip(meta.gap, 120) })
       } catch (e) {
         logger.warn(`器官 ${manifest.id} 加载失败：${e.message}`)
+        audit.append({ event: 'load_failed', organ: manifest.id, error: clip(e.message) })
       }
     }
     return loaded
   }
 
   // 自举器官的心跳调度：只调 self-made 器官的 tick（内置器官由 host.js 各自的 interval 直接调，避免重复）。
-  // 熔断：连续 3 次异常 → status='tripped'，停用，回面板看原因。
-  const trips = new Map()
+  // 熔断：连续 3 次异常 → status='tripped'，停用并停 worker，回面板看审计/原因。
   const tickAll = async () => {
     const results = []
     for (const [id, o] of organs) {
       if (o.source !== 'self-made' || o.status !== 'active' || !o.instance || typeof o.instance.tick !== 'function') continue
       try {
+        if (o.runtime && (o.runtime.failed || o.runtime.stopped)) throw new Error('器官进程已崩溃/停止')
         const r = await o.instance.tick()
         results.push({ id, ok: true, result: r })
       } catch (e) {
@@ -276,7 +473,9 @@ export function createOrganHost({ dsh, getConfig, log }) {
         trips.set(id, n)
         if (n >= 3) {
           o.status = 'tripped'
+          if (o.runtime) stopRuntime(o.runtime, 'tripped')
           logger.warn(`器官 ${id} 熔断（连续 ${n} 次异常）：${e.message}`)
+          audit.append({ event: 'trip', organ: id, trips: n, error: clip(e.message) })
         }
         results.push({ id, ok: false, error: e.message, trips: n })
       }
@@ -284,11 +483,15 @@ export function createOrganHost({ dsh, getConfig, log }) {
     return results
   }
 
-  // AI 卸载自己的器官（web_manage_organ remove 调这里）：删除目录 + 清内存。
+  // AI 卸载自己的器官（web_manage_organ remove 调这里）：停 worker + 删除目录 + 清内存。
   const remove = (id) => {
+    const o = organs.get(id)
+    if (o && o.runtime) stopRuntime(o.runtime, 'removed')
     const dir = join(selfMadeDir(), id)
     if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
     organs.delete(id)
+    trips.delete(id)
+    audit.append({ event: 'remove', organ: id })
     return { ok: true, id }
   }
 
@@ -322,5 +525,5 @@ export function createOrganHost({ dsh, getConfig, log }) {
     }
   }
 
-  return { register, registerBuiltins, list, capabilities, contextLine, loadSelfMade, remove, apiFor, bind, tickAll, toolDefs, organs, refreshIfChanged }
+  return { register, registerBuiltins, list, capabilities, contextLine, loadSelfMade, remove, bind, tickAll, toolDefs, organs, refreshIfChanged, audit }
 }

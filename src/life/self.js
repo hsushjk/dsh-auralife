@@ -7,6 +7,7 @@
 //
 // 演化只发生在「重放」（memory/replay.js），绝不覆盖出厂人设：只叠加 / 更新 conf。
 import { askModel } from '../core/llm.js'
+import { numOr } from '../core/store.js'
 
 const FIELDS = ['traits', 'values', 'boundaries']
 const MAX_PER_FIELD = 8
@@ -61,7 +62,7 @@ export function createSelf({ life, dsh, getConfig, log = console }) {
   }
 
   // 合并进 state.self：同 label 只叠 conf / 合并 ev，不重复；每类最多 MAX_PER_FIELD 条。
-  function merge(extracted, { now = Date.now() } = {}) {
+  async function merge(extracted, { now = Date.now() } = {}) {
     if (!extracted) return null
     const s = life.load()
     const cur = s.self || { version: 0, updatedAt: 0, traits: [], values: [], boundaries: [] }
@@ -73,7 +74,7 @@ export function createSelf({ life, dsh, getConfig, log = console }) {
         if (!entry || !entry.label) continue
         const label = String(entry.label).trim().slice(0, 60)
         if (!label) continue
-        const conf = Math.max(0, Math.min(1, Number(entry.conf) ?? 0.5))
+        const conf = Math.max(0, Math.min(1, numOr(entry.conf, 0.5)))
         const ev = (Array.isArray(entry.ev) ? entry.ev : []).map((x) => String(x).replace(/^#/, '').trim()).filter(Boolean)
         const existing = arr.find((e) => e.label === label)
         if (existing) {
@@ -88,7 +89,7 @@ export function createSelf({ life, dsh, getConfig, log = console }) {
 
     next.updatedAt = now
     next.version = (Number(cur.version) || 0) + 1
-    life.update((s) => { s.self = next })
+    await life.update((s) => { s.self = next })
     return next
   }
 

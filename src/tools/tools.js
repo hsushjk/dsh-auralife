@@ -201,11 +201,11 @@ export function buildTools(deps, { chat, level, sessionId }) {
             const p = String(provider || '').trim()
             const m = String(model || '').trim()
             if (!p || !m) return { ok: false, message: 'provider 和 model 都要填，先用 list 看有哪些' }
-            life.update((s) => { s.model = { provider: p, model: m, reasoningEffort: String(reasoning_effort || '').trim() || 'low', at: Date.now(), reason: String(reason || '') } })
+            life.update((s) => { s.model = { provider: p, model: m, reasoningEffort: String(reasoning_effort || '').trim() || 'low', at: Date.now(), reason: String(reason || '') } }).catch(() => {})
             return { ok: true, message: `换好了：${p}::${m}，下一句开始用它` }
           }
           if (a === 'clear') {
-            life.update((s) => { s.model = null })
+            life.update((s) => { s.model = null }).catch(() => {})
             return { ok: true, message: '用回主人配的模型了' }
           }
           return { ok: false, message: 'action 只有 list / set / clear' }
@@ -228,7 +228,7 @@ export function buildTools(deps, { chat, level, sessionId }) {
           if (owner !== undefined && owner !== null && String(owner).trim()) patch.ownerName = String(owner).trim()
           if (body !== undefined && body !== null && String(body).trim()) patch.body = String(body).trim()
           if (!Object.keys(patch).length) return { ok: false, message: '要说改成什么' }
-          const id = life.setIdentity(patch)
+          const id = await life.setIdentity(patch)
           return { ok: true, message: `改好了：我是「${id.name || '还没名字'}」${id.ownerName ? '，称呼对方「' + id.ownerName + '」' : ''}${id.body ? '，我的底色：' + id.body.slice(0, 80) : ''}` }
         },
       }))
@@ -271,7 +271,7 @@ export function buildTools(deps, { chat, level, sessionId }) {
           const d = Math.max(-10, Math.min(10, Number(delta) || 0))
           if (!d) return { ok: false, message: 'delta 要在 -10 到 10 之间且不能是 0' }
           if (!String(reason || '').trim()) return { ok: false, message: '得说清为什么调' }
-          chemistry.event({ [h]: d }, '自己调：' + String(reason).slice(0, 40))
+          chemistry.event({ [h]: d }, '自己调：' + String(reason).slice(0, 40)).catch(() => {})
           return { ok: true, message: `${h} ${d > 0 ? '+' + d : d}。理由：${reason}` }
         },
       }))
@@ -296,7 +296,7 @@ export function buildTools(deps, { chat, level, sessionId }) {
             if (sleep_at !== undefined && sleep_at !== null && String(sleep_at).trim()) patch.quietFrom = String(sleep_at).trim()
             if (wake_at !== undefined && wake_at !== null && String(wake_at).trim()) patch.quietTo = String(wake_at).trim()
             if (!Object.keys(patch).length) return { ok: false, message: '要说改成几点（HH:MM 格式）' }
-            const r = life.setRhythm(patch)
+            const r = await life.setRhythm(patch)
             return { ok: true, message: `作息更新：${r.quietFrom} 睡，${r.quietTo} 醒。这段时间我不会主动找对方。` }
           }
           return { ok: false, message: 'action 只有 list / set' }
@@ -325,14 +325,14 @@ export function buildTools(deps, { chat, level, sessionId }) {
             // 防污染：执念一句话就够；模型把工具返回的总结文案再 append 回来时，会写出「加了条…把…了结了」这种合并句
             if (body.length > 80) return { ok: false, message: '太长了，就写事情本身（80 字内）' }
             if (/了结|记下了|加了条|把「|把"/.test(body)) return { ok: false, message: '只写事情本身，别写操作描述' }
-            const w = wishes.add(body)
+            const w = await wishes.add(body)
             return { ok: true, message: '记下了', id: w?.id }
           }
           if (a === 'resolve') {
             if (!body) return { ok: false, message: '要说哪件事了结了' }
             const target = wishes.list().find((w) => w.status === 'open' && (w.text.includes(body) || body.includes(w.text)))
             if (!target) return { ok: false, message: '没找到这件挂念的事，用 read 看看' }
-            wishes.resolve(target.id, '自己了结')
+            await wishes.resolve(target.id, '自己了结')
             return { ok: true, message: '了结了' }
           }
           return { ok: false, message: 'action 只有 read / append / resolve' }
@@ -360,13 +360,14 @@ export function buildTools(deps, { chat, level, sessionId }) {
           }
           if (a === 'cancel') {
             if (!id) return { ok: false, message: '要取消哪个，先用 list 看 id' }
-            return alarm.cancel(String(id)) ? { ok: true, message: '撤掉了' } : { ok: false, message: '没找到这个闹钟（可能已经响过了）' }
+            const cancelled = await alarm.cancel(String(id))
+            return cancelled ? { ok: true, message: '撤掉了' } : { ok: false, message: '没找到这个闹钟（可能已经响过了）' }
           }
           let t = null
           if (in_minutes !== undefined && in_minutes !== null && Number(in_minutes) > 0) t = Date.now() + Number(in_minutes) * 60_000
           else if (fire_at) t = resolveAt(String(fire_at))
           if (!t) return { ok: false, message: '要给个时间：fire_at（ISO 或 HH:MM）或 in_minutes（几分钟后）' }
-          const r = alarm.setAlarm(t, String(reason || ''))
+          const r = await alarm.setAlarm(t, String(reason || ''))
           return r.ok ? { ok: true, message: `闹钟设好了：${new Date(t).toLocaleString('zh-CN', { hour12: false })}${r.alarm?.reason ? '（' + r.alarm.reason + '）' : ''}`, id: r.id } : r
         },
       }))

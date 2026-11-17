@@ -112,7 +112,7 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
     const owner = cfg.ownerName || '主人'
     const now = Date.now()
     const w = wishes.top(now)
-    const s = update((st) => {
+    const s = await update((st) => {
       st.last = now
       st.lastTopic = topic
       st.lastSpokeAt = now // 主动开口后记一笔，用户一直不理 → 内分泌要有「被冷落」反应
@@ -120,7 +120,7 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
       if (w) st.lastWish = w.id
       return st
     })
-    if (w) wishes.bump(w.id, 1)
+    if (w) await wishes.bump(w.id, 1)
     log.info(`自驱（${reason}）${w ? '，挂念：' + w.text : ''}${topic ? '，由头：' + topic : ''}`)
     // S5 传讯：开口前先广播「她为什么找你」，配套 IM 客户端据此显示有意义的通知
     // （不只一条干巴巴的消息，而是「她因为挂念 X / 冲动 Y / 心情 Z 来找你」）。
@@ -142,7 +142,7 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
     const cfg = getConfig()
     const owner = cfg.ownerName || '主人'
     const now = Date.now()
-    update((st) => {
+    await update((st) => {
       st.last = now
       st.lastSpokeAt = now // 闹钟开口同样算「主动搭话」
       st.coldMarked = false
@@ -239,14 +239,14 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
 
   // 主动开口后主人一直不理，「被冷落」只记一次（等主人下次说话再重置）。
   function markCold() {
-    update((s) => { s.coldMarked = true })
+    update((s) => { s.coldMarked = true }).catch((error) => log.warn('冷落标记写失败：' + (error?.message || error)))
   }
   function clearSpoke() {
     update((s) => {
       if (!s.lastSpokeAt && !s.coldMarked) return
       s.lastSpokeAt = 0
       s.coldMarked = false
-    })
+    }).catch((error) => log.warn('开口状态写失败：' + (error?.message || error)))
   }
 
   function state() {

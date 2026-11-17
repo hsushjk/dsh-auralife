@@ -49,9 +49,9 @@ export function createEnergy({ life, getConfig, log }) {
   }
 
   // 落盘恢复结果（60s 心跳用）。
-  function tick(now = Date.now()) {
+  async function tick(now = Date.now()) {
     const next = peek(now)
-    save(next)
+    await save(next)
     return next
   }
 

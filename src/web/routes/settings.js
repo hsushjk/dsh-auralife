@@ -136,10 +136,10 @@ export function register(router, ctx) {
     const me = requireOwner(req, res); if (!me) return
     const b = await readBody(req)
     if (b?.resolve) {
-      const w = wishes.resolve(String(b.id || ''), String(b.closedBy || ''))
+      const w = await wishes.resolve(String(b.id || ''), String(b.closedBy || ''))
       // 了结一桩心事：多巴胺小涨（+4，事情成了）+ 血清素涨（+2，踏实了）。
       if (w) {
-        chemistry?.event?.({ dopamine: 4, serotonin: 2 }, '了结了一桩心事')
+        await Promise.resolve(chemistry?.event?.({ dopamine: 4, serotonin: 2 }, '了结了一桩心事')).catch(() => {})
       }
       return json(res, { ok: true, wish: w })
     }
@@ -148,7 +148,7 @@ export function register(router, ctx) {
     const tr = Number(b.tensionRate)
     if (Number.isFinite(bt)) opts.baseTension = bt
     if (Number.isFinite(tr)) opts.tensionRate = tr
-    const w = wishes.add(String(b.text || '').trim(), opts)
+    const w = await wishes.add(String(b.text || '').trim(), opts)
     return json(res, { ok: true, wish: w })
   })
 
@@ -161,7 +161,7 @@ export function register(router, ctx) {
   router.add('POST', 'api/self', async (req, res) => {
     const me = requireOwner(req, res); if (!me) return
     const b = await readBody(req)
-    if (b?.reset) return json(res, { ok: true, self: self ? self.reset() : null })
+    if (b?.reset) return json(res, { ok: true, self: self ? await self.reset() : null })
     return json(res, { ok: false, message: '只支持 reset' })
   })
 }

@@ -34,10 +34,8 @@ export function register(router, ctx) {
     const { hub, chemistry, energy, wishes, life, self, memory, alarm } = ctx.deps || {}
     const done = (extra = {}) => json(res, { ok: true, module: mod, action, ...extra })
     const bad = (reason) => json(res, { ok: false, reason: String(reason) })
-    // 直改 state 的通用工具（chemistry/energy 都落盘 state.json）； 走锁内 RMW
-    const patchState = (fn) => {
-      life.update((s) => { fn(s) })
-    }
+    // 直改 state 的通用工具（chemistry/energy 都落盘 state.json）； 走锁内 RMW（锁是异步的，必须 await）
+    const patchState = (fn) => life.update((s) => fn(s))
 
     try {
       // ——— memory ———
@@ -64,7 +62,7 @@ export function register(router, ctx) {
         }
         if (action === 'forget') {
           if (!b.id) return bad('要忘哪条，给 id')
-          const r = memory.forget(String(b.id))
+          const r = await memory.forget(String(b.id))
           log.warn(`[debug] memory.forget：${b.id}`)
           return done(r)
         }
@@ -89,7 +87,7 @@ export function register(router, ctx) {
       // ——— chemistry ———
       if (mod === 'chemistry') {
         if (action === 'set') {
-          patchState((s) => {
+          await patchState((s) => {
             if (Number.isFinite(Number(b.dopamine))) s.chemistry.dopamine = num(b.dopamine, 50, 0, 100)
             if (Number.isFinite(Number(b.cortisol))) s.chemistry.cortisol = num(b.cortisol, 20, 0, 100)
             if (Number.isFinite(Number(b.serotonin))) s.chemistry.serotonin = num(b.serotonin, 50, 0, 100)
@@ -99,12 +97,12 @@ export function register(router, ctx) {
           return done({ chemistry: chemistry.peek() })
         }
         if (action === 'reset') {
-          patchState((s) => { s.chemistry = { version: 1, at: Date.now(), dopamine: 50, cortisol: 20, serotonin: 50 } })
+          await patchState((s) => { s.chemistry = { version: 1, at: Date.now(), dopamine: 50, cortisol: 20, serotonin: 50 } })
           log.warn('[debug] chemistry.reset')
           return done({ chemistry: chemistry.peek() })
         }
         if (action === 'event') {
-          chemistry.event(b.delta && typeof b.delta === 'object' ? b.delta : { dopamine: num(b.dopamine, 0, -50, 50), cortisol: num(b.cortisol, 0, -50, 50), serotonin: num(b.serotonin, 0, -50, 50) })
+          chemistry.event(b.delta && typeof b.delta === 'object' ? b.delta : { dopamine: num(b.dopamine, 0, -50, 50), cortisol: num(b.cortisol, 0, -50, 50), serotonin: num(b.serotonin, 0, -50, 50) }).catch(() => {})
           log.warn(`[debug] chemistry.event：${JSON.stringify(b.delta || {})}`)
           return done({ chemistry: chemistry.peek() })
         }
@@ -113,7 +111,7 @@ export function register(router, ctx) {
       // ——— energy ———
       if (mod === 'energy') {
         if (action === 'set') {
-          patchState((s) => {
+          await patchState((s) => {
             if (Number.isFinite(Number(b.level))) s.energy.level = num(b.level, 100, 0, 100)
             s.energy.at = Date.now()
           })
@@ -121,12 +119,12 @@ export function register(router, ctx) {
           return done({ energy: energy.peek() })
         }
         if (action === 'reset') {
-          patchState((s) => { s.energy = { version: 1, at: Date.now(), level: 100 } })
+          await patchState((s) => { s.energy = { version: 1, at: Date.now(), level: 100 } })
           log.warn('[debug] energy.reset')
           return done({ energy: energy.peek() })
         }
         if (action === 'spend') {
-          const r = energy.spend()
+          const r = await energy.spend()
           log.warn('[debug] energy.spend')
           return done({ energy: r })
         }
@@ -139,7 +137,7 @@ export function register(router, ctx) {
           return done({ wishes: wishes.list() })
         }
         if (action === 'add') {
-          const w = wishes.add(String(b.text || 'debug 执念'), { baseTension: num(b.baseTension, 80, 0, 100), tensionRate: num(b.tensionRate, 5, 0, 50) })
+          const w = await wishes.add(String(b.text || 'debug 执念'), { baseTension: num(b.baseTension, 80, 0, 100), tensionRate: num(b.tensionRate, 5, 0, 50) })
           log.warn(`[debug] wishes.add：${w.text}`)
           return done({ wish: w })
         }
@@ -148,13 +146,13 @@ export function register(router, ctx) {
           if (b.id) target = wishes.list().find((w) => w.id === String(b.id))
           else target = wishes.list().find((w) => w.status === 'open' && (w.text.includes(String(b.text || '')) || String(b.text || '').includes(w.text)))
           if (!target) return bad('没找到这条执念')
-          const w = wishes.resolve(target.id, String(b.closedBy || 'debug 了结'))
+          const w = await wishes.resolve(target.id, String(b.closedBy || 'debug 了结'))
           log.warn(`[debug] wishes.resolve：${target.text}`)
           return done({ wish: w })
         }
         if (action === 'clear') {
           const n = wishes.list().length
-          patchState((s) => { s.wishes = [] })
+          await patchState((s) => { s.wishes = [] })
           log.warn(`[debug] wishes.clear：${n} 条`)
           return done({ cleared: n })
         }
@@ -174,7 +172,7 @@ export function register(router, ctx) {
           if (!['traits', 'values', 'boundaries'].includes(field)) return bad('field 只能是 traits/values/boundaries')
           const label = String(b.label || '').trim()
           if (!label) return bad('要删哪条，给 label')
-          const out = life.update((st) => {
+          const out = await life.update((st) => {
             const arr = (st.self && st.self[field]) || []
             const next = arr.filter((x) => String(x.label || '') !== label)
             if (next.length === arr.length) return { notFound: true }
@@ -188,14 +186,14 @@ export function register(router, ctx) {
           return done({ self: out.self })
         }
         if (action === 'reset') {
-          const r = self ? self.reset() : life.resetSelf()
+          const r = self ? await self.reset() : await life.resetSelf()
           log.warn('[debug] self.reset')
           return done({ self: r })
         }
         if (action === 'set') {
           const field = String(b.field || 'traits')
           const entries = Array.isArray(b.entries) ? b.entries.map((e) => ({ label: String(e.label || '').slice(0, 40), conf: num(e.conf, 0.6, 0, 1), src: String(e.src || 'manual'), ev: Array.isArray(e.ev) ? e.ev.slice(0, 12) : [] })) : []
-          const r = life.setSelfField(field, entries)
+          const r = await life.setSelfField(field, entries)
           log.warn(`[debug] self.set：${field} ${entries.length} 条`)
           return done({ self: r })
         }
@@ -204,12 +202,12 @@ export function register(router, ctx) {
       // ——— identity（模拟 Ta 改人格）———
       if (mod === 'identity') {
         if (action === 'set') {
-          const id = life.setIdentity({ name: b.name, ownerName: b.ownerName, body: b.body })
+          const id = await life.setIdentity({ name: b.name, ownerName: b.ownerName, body: b.body })
           log.warn(`[debug] identity.set：${JSON.stringify(id)}`)
           return done({ identity: id })
         }
         if (action === 'reset') {
-          const id = life.setIdentity({ name: '', ownerName: '', body: '' })
+          const id = await life.setIdentity({ name: '', ownerName: '', body: '' })
           log.warn('[debug] identity.reset（回出厂种子）')
           return done({ identity: id })
         }
@@ -224,19 +222,19 @@ export function register(router, ctx) {
         }
         if (action === 'cancel') {
           if (!b.id) return bad('取消哪个闹钟，给 id')
-          const r = alarm.cancel(String(b.id))
+          const r = await alarm.cancel(String(b.id))
           log.warn(`[debug] alarm.cancel：${b.id}`)
           return done({ ok: r })
         }
         if (action === 'set') {
           const at = Number(b.at) || Date.parse(String(b.at || '')) || (Date.now() + num(b.in_minutes, 5, 0, 100000) * 60000)
-          const a = alarm.setAlarm(at, String(b.reason || 'debug 闹钟'), b.payload)
+          const a = await alarm.setAlarm(at, String(b.reason || 'debug 闹钟'), b.payload)
           log.warn(`[debug] alarm.set：${a?.id}`)
           return done({ alarm: a })
         }
         if (action === 'clear') {
           const n = alarm.list().length
-          patchState((s) => { s.alarms = [] })
+          await patchState((s) => { s.alarms = [] })
           log.warn(`[debug] alarm.clear：${n} 个`)
           return done({ cleared: n })
         }
@@ -259,7 +257,7 @@ export function register(router, ctx) {
           return done({ chatId, before: statsBefore })
         }
         if (action === 'inject') {
-          const msg = hub.appendMessage(chatId, {
+          const msg = await hub.appendMessage(chatId, {
             t: Number(b.t) || Date.now(),
             who: String(b.who || 'user') === 'bot' ? 'bot' : 'user',
             uid: String(b.who || 'user') === 'bot' ? undefined : (b.uid || OWNER_ID),

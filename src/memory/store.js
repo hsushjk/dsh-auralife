@@ -12,7 +12,7 @@
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { dataDir, ensureDir, withFileLock } from '../core/store.js'
+import { dataDir, ensureDir, numOr, withFileLock } from '../core/store.js'
 
 export const monthKey = (t = Date.now()) => {
   const d = new Date(t)
@@ -78,7 +78,7 @@ export function createMemStore({ log = console } = {}) {
       subj: String(f.subj ?? f.about ?? ''),
       aboutName: String(f.aboutName || ''),
       src: f.src || 'inferred',
-      conf: Math.max(0, Math.min(1, Number(f.conf) ?? 0.5)),
+      conf: Math.max(0, Math.min(1, numOr(f.conf, 0.5))),
       ev: Array.isArray(f.ev) ? f.ev : [],
       supersedes: f.supersedes || null,
       archived: Boolean(f.archived),
@@ -199,7 +199,7 @@ export function createMemStore({ log = console } = {}) {
       raw: e.raw || null, // { segId, from, to } 只存原文区间指针
       summary: String(e.summary || ''),
       tags: Array.isArray(e.tags) ? e.tags.slice(0, 8) : [],
-      salience: Math.max(0, Math.min(1, Number(e.salience) ?? 0.5)),
+      salience: Math.max(0, Math.min(1, numOr(e.salience, 0.5))),
       d: e.d ?? null, // 区分度，Slice 4 填
       S: e.S ?? null, // 记忆强度，Slice 4 用
       recallCount: Number(e.recallCount) || 0,
@@ -217,7 +217,7 @@ export function createMemStore({ log = console } = {}) {
       a: String(e.a || ''),
       b: String(e.b || ''),
       kind: e.kind || 'assoc', // evidence | assoc
-      w: Math.max(0, Number(e.w) ?? 1),
+      w: Math.max(0, numOr(e.w, 1)),
       why: String(e.why || ''),
       at: e.at ?? Date.now(),
     }

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
 import { parseReply, bubbleDelay } from './reply.js'
-import { levelFor, presetFor, isOwner } from './access.js'
+import { levelFor, presetFor, isOwner, OWNER_ID } from './access.js'
 import { fetchImage } from '../core/net.js'
 import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
@@ -61,8 +61,10 @@ export function createHub({
   const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
 
   // 多进程下每个进程都跑一份插件，sessions.json 的读写要进锁，防互相覆盖丢会话映射。
-  function map() { return withFileLock('sessions', () => readJson(sessionsFile(), () => ({ chats: {} })), { staleMs: 5000, timeoutMs: 4000 }) }
-  function saveMap(m) { withFileLock('sessions', () => writeJson(sessionsFile(), m), { staleMs: 5000, timeoutMs: 4000 }) }
+  // 读路径不再进锁：writeJson 走「暂存文件 + rename」原子替换，读到的永远是完整 JSON；
+  // 锁只串行化写，避免异步锁把同步读接口（sessions()）也拖成 Promise。
+  function map() { return readJson(sessionsFile(), () => ({ chats: {} })) }
+  async function saveMap(m) { await withFileLock('sessions', () => writeJson(sessionsFile(), m), { staleMs: 5000, timeoutMs: 4000 }) }
 
   // —— 上下文兜底估算用量，接近上限就把旧会话归档、开新会话 ——
   // 窗口优先级手动配置 chat.contextWindow > DSH 平台事件带出的 liveWindow
@@ -155,8 +157,8 @@ export function createHub({
     try { unlinkSync(join(chatlogDir(), `${day}.jsonl`)) } catch {}
   }
 
-  function appendMessage(chatId, payload) {
-    const msg = history.append(chatId, payload)
+  async function appendMessage(chatId, payload) {
+    const msg = await history.append(chatId, payload)
     emit?.('message', { chatId, message: msg })
     history.touch(chatId)
     return msg
@@ -318,28 +320,28 @@ export function createHub({
     if (needNew) {
       entry = await createSession(chat, level)
       m.chats[chat.chatId] = entry
-      saveMap(m)
+      await saveMap(m)
     }
     let agent = null
     try { agent = await resolveAgent(entry.sessionId) } catch (e) { agent = null }
     if (!agent) {
       entry = await createSession(chat, level)
       m.chats[chat.chatId] = entry
-      saveMap(m)
+      await saveMap(m)
       agent = await resolveAgent(entry.sessionId)
     }
     const mk = modelKey()
     if (entry.modelKey && entry.modelKey !== mk) await applyModel(agent)
     entry.modelKey = mk
     m.chats[chat.chatId] = entry
-    saveMap(m)
+    await saveMap(m)
     sessionToChat.set(sessionKey(entry.sessionId), chat.chatId)
     mount(agent, chat, level)
     return agent
   }
 
   async function sendText(chatId, text) {
-    appendMessage(chatId, { who: 'bot', text, kind: 'text' })
+    await appendMessage(chatId, { who: 'bot', text, kind: 'text' })
     bump('messages')
     return true
   }
@@ -349,7 +351,7 @@ export function createHub({
       const { file, engine } = await tts.speak(text)
       const b64 = readFileSync(file).toString('base64')
       const voiceMime = String(file).endsWith('.wav') ? 'audio/wav' : 'audio/mpeg'
-      appendMessage(chatId, { who: 'bot', text, kind: 'voice', voice: b64, voiceMime, engine })
+      await appendMessage(chatId, { who: 'bot', text, kind: 'voice', voice: b64, voiceMime, engine })
       bump('voice')
       return true
     } catch (e) {
@@ -366,7 +368,7 @@ export function createHub({
     if (!item && lib.length) item = lib[Math.floor(Math.random() * lib.length)]
     if (!item) { log.debug('表情库是空的，跳过表情'); return false }
 
-    appendMessage(chatId, { who: 'bot', text: '[表情]', kind: 'sticker', sticker: item.md5, name: item.name || '', caption: item.name || '', mark: 'sticker' })
+    await appendMessage(chatId, { who: 'bot', text: '[表情]', kind: 'sticker', sticker: item.md5, name: item.name || '', caption: item.name || '', mark: 'sticker' })
     stickers.markUsed?.(item.md5)
     bump('stickers')
     return true
@@ -377,7 +379,7 @@ export function createHub({
       const buf = Buffer.isBuffer(src) ? src : await fetchImage(src, { maxBytes: 10 * 1024 * 1024 })
       const mime = mimeOf(buf)
       if (mime && mime.startsWith('image/')) {
-        appendMessage(chatId, { who: 'bot', text: '[图片]', kind: 'image', image: buf.toString('base64'), imageMime: mime, mark: 'ai-image' })
+        await appendMessage(chatId, { who: 'bot', text: '[图片]', kind: 'image', image: buf.toString('base64'), imageMime: mime, mark: 'ai-image' })
         bump('images')
         return true
       }
@@ -392,7 +394,7 @@ export function createHub({
       if (!text.trim()) { log.warn('文件内容是空的，不发了'); return false }
       const fileName = String(name || 'message.txt').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || 'message.txt'
       const saved = history.saveMedia(chatId, Buffer.from(text, 'utf8').toString('base64'), 'text/plain')
-      appendMessage(chatId, { who: 'bot', text: '[文件] ' + fileName, kind: 'file', fileName, fileMime: 'text/plain', mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes: saved.bytes, mark: 'ai-file' })
+      await appendMessage(chatId, { who: 'bot', text: '[文件] ' + fileName, kind: 'file', fileName, fileMime: 'text/plain', mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes: saved.bytes, mark: 'ai-file' })
       bump('images')
       return true
     } catch (e) { log.warn('文件发不出去：' + e.message); return false }
@@ -421,8 +423,10 @@ export function createHub({
     }
     logChat(chatId, 'bot', items.map((i) => (i.kind === 'text' || i.kind === 'voice' || i.kind === 'file' ? i.value : `[${i.kind}]`)).join(' '))
     lastChatAt = Date.now()
-    if (isOwner(cfg, chatId)) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
-    onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '' })
+    const ownerChat = isOwner(cfg, chatId)
+    if (ownerChat) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
+    // 附带 userId/level：宿主侧靠它区分「主人会话」和「客人会话」（器官自举只允许主人触发）。
+    onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '', userId: ownerChat ? OWNER_ID : chatId, level: ownerChat ? 'full' : 'social' })
   }
 
   async function deliverTo(target, text) {
@@ -484,17 +488,17 @@ export function createHub({
     let userSticker = null
     const chat = { chatId, userId, nickname: nickname || userId, ...(level ? { level } : {}) }
     if (voice && voice.data) {
-      appendMessage(chatId, { who: 'user', uid: userId, text: `[语音 · ${Math.round(voice.dur || 0)}秒]`, kind: 'voice', voice: voice.data, voiceMime: voice.mime || 'audio/webm', dur: Math.round(voice.dur || 0) })
+      await appendMessage(chatId, { who: 'user', uid: userId, text: `[语音 · ${Math.round(voice.dur || 0)}秒]`, kind: 'voice', voice: voice.data, voiceMime: voice.mime || 'audio/webm', dur: Math.round(voice.dur || 0) })
       logChat(chatId, nickname || userId, '[语音]', userId)
       bump('voice')
     } else if (sticker) {
       const item = stickers.library().items.find((i) => i.md5 === sticker) || null
       userSticker = item
-      appendMessage(chatId, { who: 'user', uid: userId, text: '[表情]', kind: 'sticker', sticker, name: item?.name || '', mark: 'user-sticker' })
+      await appendMessage(chatId, { who: 'user', uid: userId, text: '[表情]', kind: 'sticker', sticker, name: item?.name || '', mark: 'user-sticker' })
       logChat(chatId, nickname || userId, `[表情${item?.name ? ' ' + item.name : ''}]`, userId)
       bump('sticker')
     } else if (text) {
-      appendMessage(chatId, { who: 'user', uid: userId, text, kind: 'text' })
+      await appendMessage(chatId, { who: 'user', uid: userId, text, kind: 'text' })
       logChat(chatId, nickname || userId, text, userId)
     }
     lastChatAt = Date.now()
@@ -523,7 +527,7 @@ export function createHub({
 
         const last = history.last(chatId)
         if (last && last.kind === 'voice' && !last.heard) {
-          history.patchLast(chatId, { heard })
+          await history.patchLast(chatId, { heard })
           emit?.('message', { chatId, message: { ...last, heard } })
         }
         logChat(chatId, nickname || userId, `[语音] ${heard}`, userId)
@@ -538,7 +542,7 @@ export function createHub({
     }
     for (const img of images) {
       content.push({ type: 'image', data: img.data, mediaType: img.mediaType || 'image/png', name: img.name || 'image' })
-      appendMessage(chatId, { who: 'user', uid: userId, text: '[图片]', kind: 'image', image: img.data, imageMime: img.mediaType || 'image/png', mark: 'user-image' })
+      await appendMessage(chatId, { who: 'user', uid: userId, text: '[图片]', kind: 'image', image: img.data, imageMime: img.mediaType || 'image/png', mark: 'user-image' })
       logChat(chatId, nickname || userId, '[图片]', userId)
 
       if (cfg.stickers?.steal !== false && stickers?.addFromBuffer) {
@@ -559,7 +563,7 @@ export function createHub({
       let saved = null
       try { saved = history.saveMedia(chatId, f.data, mime) } catch (err) { log.warn('存文件失败：' + err.message) }
       const bytes = saved ? saved.bytes : raw.length
-      appendMessage(chatId, { who: 'user', uid: userId, text: '[文件] ' + name, kind: 'file', fileName: name, fileMime: mime, ...(saved ? { mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes } : {}) })
+      await appendMessage(chatId, { who: 'user', uid: userId, text: '[文件] ' + name, kind: 'file', fileName: name, fileMime: mime, ...(saved ? { mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes } : {}) })
       logChat(chatId, nickname || userId, '[文件] ' + name, userId)
       bump('images')
       // 文本类文件：读出内容给 Ta 看（cap 4000 字）；二进制：只告知收到
@@ -728,7 +732,7 @@ export function createHub({
       sessionToChat.delete(sessionKey(entry.sessionId))
       turnState.delete(sessionKey(entry.sessionId))
       delete m.chats[chatId]
-      saveMap(m)
+      await saveMap(m)
     }
   }
 

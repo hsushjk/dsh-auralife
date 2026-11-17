@@ -9,7 +9,7 @@
 import { recallability } from './recall.js'
 import { similarity } from './similar.js'
 import { createAssess } from './assess.js'
-import { withFileLock } from '../core/store.js'
+import { numOr, withFileLock } from '../core/store.js'
 
 // 遗忘阈值：recallability 低于此值且非硬档 → 忘掉。
 // recallability = exp(-days / tau)，tau = 20×strength×(0.5+conf)。
@@ -63,21 +63,21 @@ export function createReplay({ store, life, self, dsh, getConfig, log = console 
   }
 
   // 2) 遗忘：非硬档按 recallability、硬档按烙印曲线（极难磨灭但可磨灭）
-  function forget(now = Date.now()) {
+  async function forget(now = Date.now()) {
     const gone = []
     for (const f of store.currentFacts()) {
       if (f.archived) {
         // 烙印：tau 365 天、阈值 0.001（约 7 年）。不是不磨灭，是磨得极慢。
         const days = Math.max(0, (now - (f.t0 || now)) / 86400_000)
         const r = Math.exp(-days / BRAND_TAU_DAYS)
-        if (r < BRAND_FORGET_RECALLABILITY && store.forget(f.id, now)) {
+        if (r < BRAND_FORGET_RECALLABILITY && await store.forget(f.id, now)) {
           gone.push({ id: f.id, text: f.text, recallability: Number(r.toFixed(4)), brand: true })
           log.info(`烙印磨灭：「${f.text.slice(0, 40)}」(recallability=${r.toFixed(4)})`)
         }
         continue
       }
       const r = recallability(f, now)
-      if (r < FORGET_RECALLABILITY && store.forget(f.id, now)) {
+      if (r < FORGET_RECALLABILITY && await store.forget(f.id, now)) {
         gone.push({ id: f.id, text: f.text, recallability: Number(r.toFixed(4)) })
         log.info(`遗忘：「${f.text.slice(0, 40)}」(recallability=${r.toFixed(4)})`)
       }
@@ -88,11 +88,11 @@ export function createReplay({ store, life, self, dsh, getConfig, log = console 
   // 3) 提炼自我：只挑「她做过/答应过/被推测」且高可信的事实
   async function extractSelf(now = Date.now()) {
     const candidates = store.currentFacts().filter(
-      (f) => (f.src === 'self_did' || f.src === 'inferred') && (Number(f.conf) ?? 0) >= 0.5,
+      (f) => (f.src === 'self_did' || f.src === 'inferred') && numOr(f.conf, 0) >= 0.5,
     )
     if (!candidates.length) return { extracted: null, merged: false, version: null }
     const extracted = await self.extract(candidates, { now })
-    const merged = self.merge(extracted, { now })
+    const merged = await self.merge(extracted, { now })
     return { extracted, merged: !!merged, version: merged ? merged.version : null }
   }
 
@@ -102,7 +102,7 @@ export function createReplay({ store, life, self, dsh, getConfig, log = console 
     return withFileLock('memory-tick', async () => {
       const before = store.stats()
       const edges = buildEdges(now)
-      const forgotten = forget(now)
+      const forgotten = await forget(now)
       const audited = await assess.auditFacts(now)
       const selfOut = await extractSelf(now)
       const after = store.stats()

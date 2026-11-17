@@ -19,10 +19,10 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
   const file = () => dataDir('diary.json')
   const state = () => readJson(file(), () => ({ triggers: { day: '', idle: [], event: [] }, history: [] }))
   const save = (s) => writeJson(file(), s)
-  // 多进程锁：多进程心跳会同时判「闲着该写日记」→ 重复写。RMW 走锁。
-  const update = (fn) => withFileLock('diary', () => {
+  // 多进程锁：多进程心跳会同时判「闲着该写日记」→ 重复写。RMW 走锁（异步，不阻塞事件循环）。
+  const update = async (fn) => withFileLock('diary', async () => {
     const s = state()
-    const out = fn(s)
+    const out = await fn(s)
     save(s)
     return out
   })
@@ -111,7 +111,7 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     const inWindow = nowMin >= toMin(DIARY_BUILTIN.quietFrom) && nowMin <= toMin(DIARY_BUILTIN.quietTo)
 
     // 先锁内看今天的触发器计数（顺带重置跨天），再决定要不要写——双进程不会同时开写。
-    const gates = update((s) => {
+    const gates = await update((s) => {
       if (!s.triggers || s.triggers.day !== today) s.triggers = { day: today, idle: [], event: [] }
       let dueIdle = false
       if (inWindow) {
@@ -139,7 +139,7 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     if (gates.dueIdle) {
       log.info('闲着有一阵了，写一篇空间日记')
       const r = await writeDiary()
-      if (r?.ok) update((s) => { s.triggers.idle.push(Date.now()) }) 
+      if (r?.ok) await update((s) => { s.triggers.idle.push(Date.now()) })
       else lastFailAt = Date.now()
       return
     }
@@ -147,7 +147,7 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     if (gates.dueEvent) {
       log.info('今天情绪有大波动，写一篇空间日记')
       const r = await writeDiary()
-      if (r?.ok) update((s) => { s.triggers.event.push(Date.now()) })
+      if (r?.ok) await update((s) => { s.triggers.event.push(Date.now()) })
       else lastFailAt = Date.now()
     }
   }

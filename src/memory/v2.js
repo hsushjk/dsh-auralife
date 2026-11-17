@@ -8,7 +8,7 @@
 // 提供同签名兼容垫片（profiles/insights/styles 落到 mem/archive.json）。
 import { readdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, numOr, readJson, writeJson, withFileLock } from '../core/store.js'
 import { createMemStore } from './store.js'
 import { createRecall } from './recall.js'
 import { createReceipt } from './receipt.js'
@@ -33,7 +33,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
   const replay = createReplay({ store, life, self, dsh, getConfig, log })
 
   // 一次性迁移（幂等，可重复跑）：memories.json → mem/facts + mem/archive.json
-  migrateLegacy({ store, log })
+  migrateLegacy({ store, log }).catch((error) => log.warn('记忆迁移失败：' + (error?.message || error)))
 
   // ---- 水位线 / 运行记录 ----
   const watermarkFile = () => dataDir('mem', 'watermark.json')
@@ -207,7 +207,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
   }
 
   // ---- 写入 / 读取（v2 语义，tools.js 与 web 面板共用）----
-  const clamp = (n) => Math.max(0, Math.min(1, Number(n) ?? 0.5))
+  const clamp = (n) => Math.max(0, Math.min(1, numOr(n, 0.5)))
 
   // 记一条事实：判重命中则 bumpHit（不动 t0），否则追加新行。
   function remember({ text, about = '', aboutName = '', conf = 0.5, source = 'tool', chatId = '', tags = [] }) {
@@ -218,7 +218,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
     const subj = String(about || '')
     const dup = store.currentFacts().find((f) => isDup({ text: t, subj }, f))
     if (dup) {
-      store.bumpHit(dup.id)
+      store.bumpHit(dup.id).catch((error) => log.warn('记忆命中计数写失败：' + (error?.message || error)))
       return { ok: true, message: '✓', id: dup.id, updated: true, fact: store.findFact(dup.id) }
     }
     const f = store.addFact({ text: t, subj, aboutName: String(aboutName || ''), src, conf: c, chatId: String(chatId || ''), tags: (tags || []).slice(0, 5), archived: isHardFact({ text: t, src, conf: c }) })
@@ -226,21 +226,21 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
   }
 
   // 修正一条事实：追加新行 + supersedes 链，旧行不变（t0 继承旧版）。
-  function revise(id, patch = {}) {
+  async function revise(id, patch = {}) {
     const f = store.findFact(id)
     if (!f) return { ok: false, message: '没找到这条' }
     const text = patch.text !== undefined ? String(patch.text).trim().slice(0, 200) : f.text
     if (!text) return { ok: false, message: '内容是空的' }
     const conf = patch.conf !== undefined ? clamp(patch.conf) : f.conf
-    const nf = store.supersede(f.id, { text, subj: f.subj, aboutName: patch.aboutName ?? f.aboutName, src: f.src, conf, chatId: f.chatId, tags: Array.isArray(patch.tags) ? patch.tags.slice(0, 5) : f.tags, archived: f.archived })
+    const nf = await store.supersede(f.id, { text, subj: f.subj, aboutName: patch.aboutName ?? f.aboutName, src: f.src, conf, chatId: f.chatId, tags: Array.isArray(patch.tags) ? patch.tags.slice(0, 5) : f.tags, archived: f.archived })
     return { ok: true, message: '改好了', id: nf.id, fact: nf }
   }
 
   // 遗忘一条事实：记墓碑（invalidAt），旧行不改。
-  function forget(id) {
+  async function forget(id) {
     const f = store.findFact(id)
     if (!f) return { ok: false, message: '没找到这条' }
-    store.forget(id)
+    await store.forget(id)
     return { ok: true }
   }
 

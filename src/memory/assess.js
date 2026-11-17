@@ -7,6 +7,7 @@
 // 拿最近的事件摘要当证据，把已经过时/被推翻的自动打墓碑（可逆，不真删）——
 // 兜底 encode 漏掉的 supersede（主人某句话隐含推翻旧事实，但编码时 LLM 没识别出 op=update）。
 import { askModel } from '../core/llm.js'
+import { numOr } from '../core/store.js'
 
 function extractJson(raw) {
   if (!raw) return null
@@ -21,7 +22,7 @@ export function createAssess({ dsh, getConfig, store, log = console }) {
   async function auditFacts(now = Date.now()) {
     const candidates = store.currentFacts().filter((f) => {
       if (f.archived) return false // 硬档（承诺/底线/雷点）永不审计
-      const conf = Number(f.conf) ?? 0.5
+      const conf = numOr(f.conf, 0.5)
       if (conf < 0.3 || conf >= 0.8) return false // 太低不值得审、太高是硬性事实
       const age = (now - Math.max(f.t0 || 0, f.lastHit || 0)) / 86400_000
       return age >= 3 // 至少 3 天没被碰过的才审
@@ -56,7 +57,7 @@ export function createAssess({ dsh, getConfig, store, log = console }) {
       for (const id of ids) {
         const f = store.findFact(String(id))
         if (!f || f.invalidAt) continue
-        if (store.forget(String(id), now)) {
+        if (await store.forget(String(id), now)) {
           outdated.push({ id: String(id), text: f.text })
           log.info(`审计遗忘：「${f.text.slice(0, 40)}」`)
         }

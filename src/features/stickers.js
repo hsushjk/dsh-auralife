@@ -136,7 +136,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
   }
 
   function markUsed(md5) {
-    // 多进程下 library 的读-改-写要进锁（审计：无锁 RMW）。
+    // 多进程下 library 的读-改-写要进锁（审计：无锁 RMW）。锁现在是异步的，这里 fire-and-forget 但要接住错误。
     withFileLock('sticker-lib', () => {
       const lib = loadLibrary()
       const it = lib.items.find((i) => i.md5 === md5)
@@ -144,7 +144,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
       it.uses = (it.uses || 0) + 1
       it.lastUsed = Date.now()
       saveLibrary(lib)
-    }, { staleMs: 5000, timeoutMs: 4000 })
+    }, { staleMs: 5000, timeoutMs: 4000 }).catch((error) => log.warn('表情使用计数写失败：' + (error?.message || error)))
   }
 
   async function remove(md5) {
