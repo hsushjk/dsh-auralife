@@ -30,8 +30,9 @@ export async function judgeChem({ dsh, getConfig, life, userText, reply, who = '
       cfg: full,
       system: `你在判断聊天角色「${bot}」聊完一轮后，这一轮对它的内分泌（多巴胺/皮质醇/血清素）的影响。${scene}。只看这一轮真正影响它的东西：被夸、被关心、被惦记 → 多巴胺/血清素该涨；被凶、被冷落、被嫌弃 → 皮质醇该涨、血清素该跌；开玩笑的「讨厌~」「笨蛋」不算真骂。只输出 JSON：{"delta": -15~15 的整数（正=聊得开心，负=聊得难受）, "reason": "十几个字的理由", "confidence": 0~1 你有多确定}。没什么影响就 delta 为 0。`,
       text: `${origin === 'speak-up' ? bot + '主动说' : who + '说'}：${String(userText || '').slice(0, 600)}\n${bot}回：${String(reply || '').slice(0, 600)}`,
-      maxTokens: 400,
+      maxTokens: 600,
       temperature: 0.2,
+      preferLowEffort: true, // 只输出内部 JSON
     })
     const m = String(out || '').match(/\{[\s\S]*\}/)
     if (!m) return null

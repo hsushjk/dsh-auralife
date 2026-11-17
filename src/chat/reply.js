@@ -27,6 +27,24 @@ export function stripMarkdown(text) {
   return out.replace(/\n{3,}/g, '\n\n').trim()
 }
 
+// ——宿主注入的 system-reminder 清理——
+// DSH 的时间上下文等插件会往对话里注入 <system-reminder>…</system-reminder>（不同版本闭合标签
+// 可能写成 </system-amber>）。模型偶尔会把这些宿主提示当正文照抄出来——那是给模型看的，不是聊天内容，
+// 发出去就是「把系统提示发进聊天」。解析前整段剥掉，残留的单独标签和标志行也一并清掉。
+const HOST_REMINDER_BLOCK = /<system-reminder>[\s\S]*?<\/system-(?:reminder|amber)>/gi
+const HOST_REMINDER_TAG = /<\/?system-(?:reminder|amber)[^>]*>/gi
+const HOST_REMINDER_TIME = /^.*Time sampled while preparing turn\b.*$/gim
+const HOST_REMINDER_CONTENT = /^\s*Current content: \d+% \(\d+\/\d+\)\s*$/gim
+
+export function stripHostReminders(text) {
+  return String(text || '')
+    .replace(HOST_REMINDER_BLOCK, '')
+    .replace(HOST_REMINDER_TAG, '')
+    .replace(HOST_REMINDER_TIME, '')
+    .replace(HOST_REMINDER_CONTENT, '')
+    .replace(/\n{3,}/g, '\n\n')
+}
+
 // ——沉默判定：几种写法的「不接话」——
 const SILENCE_FORMS = new Set([SILENCE, '［沉默］', '(沉默)', '（沉默）'])
 
@@ -82,7 +100,7 @@ function textToItems(value) {
 }
 
 export function parseReply(text) {
-  const raw = String(text || '').trim()
+  const raw = stripHostReminders(String(text || '')).trim()
   if (isSilence(raw)) return { silent: true, items: [] }
 
   const items = []

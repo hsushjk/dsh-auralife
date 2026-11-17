@@ -47,6 +47,7 @@ export function createSelf({ life, dsh, getConfig, log = console }) {
       text: list,
       maxTokens: 800,
       temperature: 0.1,
+      preferLowEffort: true, // 只输出内部 JSON
     })
     const m = String(out || '').match(/\{[\s\S]*\}/)
     let parsed = null

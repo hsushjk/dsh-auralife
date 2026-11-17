@@ -46,7 +46,7 @@ export function createAssess({ dsh, getConfig, store, log = console }) {
       const text = `最近的事件：\n${evidence}\n\n待审计的事实：\n${factLines}`
       let raw = ''
       try {
-        raw = await askModel(dsh, { cfg: getConfig(), system, text, maxTokens: 300, temperature: 0 })
+        raw = await askModel(dsh, { cfg: getConfig(), system, text, maxTokens: 1200, temperature: 0, preferLowEffort: true })
       } catch (err) {
         log.warn('auditFacts: LLM 调用失败', err.message)
         continue

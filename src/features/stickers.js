@@ -80,6 +80,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
 
         maxTokens: 1000,
         temperature: 0.2,
+        preferLowEffort: true, // 内部小任务：低思考强度更快也更省
       })
       if (!text) log.warn('看图起名：模型没给出文字')
       const line = text.split(/\r?\n/).map((s) => s.trim()).find(Boolean) || ''

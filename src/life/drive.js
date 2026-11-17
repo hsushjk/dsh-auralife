@@ -14,6 +14,7 @@ const DRIVE_BUILTIN = {
   idleMinutes: 20,      // 闲置至少这么久才考虑（评估本身会判断想不想说）
   minGapMinutes: 60,    // 两次开口最小间隔
   assessGapMinutes: 15, // 两次「冲动评估」最小间隔（不开口也限流，防每分钟烧一次模型）
+  assessLeaseMinutes: 10, // 评估租约：锁内认领后去锁外调模型，超时未落结果才允许别的进程接手
   urgeThreshold: 55,    // AI 评估的「冲动」超过它才开口
 }
 
@@ -23,10 +24,10 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
   const save = (s) => writeJson(file(), s)
   // 多进程锁：DSH 每个进程都跑 drive 心跳，load→改→save 会互相覆盖、双开口。
   // 锁内重读盘再改再写。staleMs 放宽到 2 分钟：评估冲动要调 LLM，可能比默认 15s 久。
-  const update = (fn) => withFileLock('drive', () => {
+  const update = (fn) => withFileLock('drive', async () => {
     const s = load()
-    const out = fn(s)
-    save(s)
+    const out = await fn(s)
+    save(s) // 必须等 fn 落定再写：评估这类带 await 的改动，否则改完还没落盘就 save 了
     return out
   }, { staleMs: 120000 })
 
@@ -95,7 +96,8 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
       wishLine + chemLine + `\n` +
       `只输出 JSON，不要别的：{"awake": true 或 false, "urge": 0 到 100 的整数, "topic": "你想聊的那个由头，一句话，没有就空字符串"}` +
       `\nawake：现在这个时间点，按你自己的作息你醒着吗？作息睡了就别醒（除非有急事：比如${owner}深夜突然很久没消息你担心）。`
-    const out = await askModel(dsh, { cfg, system, text, maxTokens: 200, temperature: 0.3 })
+    // 这是「只输出一小段 JSON」的内部判断：低思考强度 + 留足预算，否则 max 思考会把 200 token 吃光。
+    const out = await askModel(dsh, { cfg, system, text, maxTokens: 800, temperature: 0.3, preferLowEffort: true })
     const m = out.match(/\{[\s\S]*\}/)
     if (!m) throw new Error('评估输出不是 JSON：' + out.slice(0, 80))
     const j = JSON.parse(m[0])
@@ -172,39 +174,62 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
     // 作息静默期硬跳：睡觉就是睡觉，不评估也不开口（闹钟例外走 fireAlarm 独立链路）。
     // 之前让 LLM 自己判「醒没醒」，深夜急事例外条款被滥用，6 次开口全发在主人睡觉时。
     if (inQuiet(now)) return
-    // 评估+开口的整段调度放进文件锁——另一进程同时心跳时拿不到锁就跳过本轮，
-    // 避免双进程各评估一次、各开口一次（审计确认的最高风险点之一）。
-    let s
+    // 评估要调 LLM，可能几十秒，不能像以前那样把整段塞进文件锁：
+    // 另一个进程的心跳拿不到锁会在 8s 超时后打「让位」告警；评估卡住还会连锁重试。
+    // 改成三段式：锁内认领评估权(lease) → 锁外评估 → 锁内落结果并决定开口。
+    let claim
     try {
-      s = await update(async (st) => {
+      claim = await update((st) => {
         const today = now.toDateString()
         if (st.day !== today) Object.assign(st, { day: today, count: 0 })
-        if (Date.now() - (st.last || 0) < c.minGapMinutes * 60_000) return st
+        if (Date.now() - (st.last || 0) < c.minGapMinutes * 60_000) return { go: false }
         // 评估节流：距上次评估不足 assessGapMinutes 就不重复评估（不开口也会限流）。
-        if (Date.now() - (st.lastAssess?.at || 0) < c.assessGapMinutes * 60_000) return st
-        // 由 Ta 自己评估：醒没醒 + 想不想找主人。评估失败静默跳过（下个心跳再试）。
-        let a
-        try {
-          a = await assessUrge()
-          st.lastAssess = a
-        } catch (error) {
-          log.warn(`冲动评估失败：${error?.message || error}`)
-          return st
-        }
-        if (!a.awake) return st
-        if (a.urge < c.urgeThreshold) return st
-        st.count++
-        st.lastTopic = a.topic
-        return st
+        if (Date.now() - (st.lastAssess?.at || 0) < c.assessGapMinutes * 60_000) return { go: false }
+        // 别的进程正在评估：租约没过期就让位，避免两边同时烧模型。
+        if (Date.now() - (st.assessStartedAt || 0) < c.assessLeaseMinutes * 60_000) return { go: false }
+        st.assessStartedAt = Date.now()
+        return { go: true }
       })
     } catch (error) {
-      // 拿不到锁 = 另一个进程正在评估/开口，本心跳跳过。
+      // 拿不到锁 = 另一个进程正在改状态，本心跳跳过。
       log.warn(`自驱心跳让位（另一进程正在评估）：${error?.message || error}`)
       return
     }
-    if (!s || !s.lastAssess) return
-    const a = s.lastAssess
-    if (!a.awake || a.urge < c.urgeThreshold) return
+    if (!claim?.go) return
+
+    // 锁外评估：慢就慢，不占锁，也不挡别的进程。
+    let a
+    try {
+      a = await assessUrge()
+    } catch (error) {
+      log.warn(`冲动评估失败：${error?.message || error}`)
+      // 关键：失败也记一次评估时间。否则节流形同虚设，60s 心跳每次都重试（429 会越滚越大）。
+      try {
+        await update((st) => {
+          st.assessStartedAt = 0
+          st.lastAssess = { at: Date.now(), awake: false, urge: 0, topic: '', failed: true, error: String(error?.message || error).slice(0, 200) }
+          return st
+        })
+      } catch { /* 记不上就等租约自然过期 */ }
+      return
+    }
+
+    // 锁内落结果：评估有效 + 冲动够高才计一次开口，避免并发进程各计一次。
+    let fireIt = null
+    try {
+      fireIt = await update((st) => {
+        st.assessStartedAt = 0
+        st.lastAssess = a
+        if (!a.awake || a.urge < c.urgeThreshold) return { go: false }
+        st.count++
+        st.lastTopic = a.topic
+        return { go: true }
+      })
+    } catch (error) {
+      log.warn(`冲动评估结果没写成：${error?.message || error}`)
+      return
+    }
+    if (!fireIt?.go) return
     try {
       await fire('urge', a.topic)
     } catch (error) {

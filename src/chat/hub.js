@@ -9,9 +9,9 @@ import { fetchImage } from '../core/net.js'
 import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
 
-const WORKSPACE_DIR = process.env.AURACHAT_WORKSPACE || join(homedir(), 'AuraChat', 'chats')
+const WORKSPACE_DIR = process.env.AURALIFE_WORKSPACE || join(homedir(), 'AuraLife', 'chats')
 const WORKSPACE_TITLE = 'AuraLife · Web'
-const SOURCE_KIND = 'aurachat'
+const SOURCE_KIND = 'auralife'
 const BUSY_MAX_MS = 5 * 60 * 1000
 const MAX_TYPING_HOLD_MS = 60 * 1000
 const MERGE_MAX_SEC = 8 // 连发合并的最长窗口（内置，用户不可调）
@@ -224,6 +224,19 @@ export function createHub({
     return r.agent
   }
 
+  // 会话还在不在宿主的 SessionStore 里。缓存的 agent/session 对已被删掉的会话依然能 resolve 出对象，
+  // 直到 followup/flush 时才炸（cannot append outside a SessionStore）。所以每次用之前先验活。
+  // 老宿主没有 sessions 服务时返回 true，保持原有行为。
+  function sessionAlive(sid) {
+    const store = dsh.sessions || dsh.get('sessions')
+    if (!store || typeof store.get !== 'function') return true
+    const key = sessionKey(sid)
+    for (const id of [sid, key, 'session-' + key]) {
+      try { if (store.get(id)) return true } catch { /* 试下一个写法 */ }
+    }
+    return false
+  }
+
   // 模型选择优先级：她自己挑的（state.json.model）> 主人配的（config.model）。
   // 她想换模型就换，主人配的是「出厂默认」，她的选择是「她自己的主意」。
   function modelSel() {
@@ -297,6 +310,11 @@ export function createHub({
     let entry = m.chats[chat.chatId]
     let needNew = !entry || !entry.sessionId || entry.preset !== preset || entry.level !== level
     if (entry && entry.sessionId && (reg?.archivedSessionIds || []).includes(entry.sessionId)) needNew = true
+    // 会话被宿主删了（SessionStore 里没了）也算失效：否则会一直拿死会话重试，日记/自驱全部报错。
+    if (!needNew && entry?.sessionId && !sessionAlive(entry.sessionId)) {
+      log.warn(`会话 ${entry.sessionId} 已不在 SessionStore，重建会话`)
+      needNew = true
+    }
     if (needNew) {
       entry = await createSession(chat, level)
       m.chats[chat.chatId] = entry

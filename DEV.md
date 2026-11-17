@@ -103,7 +103,7 @@ dsh-auralife/
 ## 调试与测试
 
 - 调试台入口：左侧栏头像 5 连击 → 提示 → 第 6 击确认（localStorage auralife_debug）；再 5 连击+第 6 击关闭。只有「整理对话/记忆重放/叫 Ta 一次/写日记/社交回访」烧 token。
-- 冒烟范式：临时目录 `AURACHAT_DATA_DIR` + `pathToFileURL` 动态 import 真模块 + mock dsh/hub；断言数据落盘而非返回值。
+- 冒烟范式：临时目录 `AURALIFE_DATA_DIR` + `pathToFileURL` 动态 import 真模块 + mock dsh/hub；断言数据落盘而非返回值。
 - 前端验证：headless Chrome CDP（--remote-debugging-port → Runtime.evaluate/Page.reload 抓 console；FileList 注入用 `new DataTransfer()`）。
 - 全量语法：`node --check` 递归所有 .js/.mjs（排除 node_modules 与 local/templates）。
 

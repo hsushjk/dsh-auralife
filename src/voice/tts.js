@@ -6,8 +6,7 @@ import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { dataDir } from '../core/store.js'
 
-const LEGACY_PYENV = 'C:\\AuraChat\\pyenv'
-export const PYENV_DIR = process.env.AURACHAT_PYENV || (existsSync(LEGACY_PYENV) ? LEGACY_PYENV : join(homedir(), 'AuraChat', 'pyenv'))
+export const PYENV_DIR = process.env.AURALIFE_PYENV || join(homedir(), 'AuraLife', 'pyenv')
 // Linux 兼容：Windows 的 venv 是 Scripts/python.exe，Linux 是 bin/python。
 const pyExe = () => join(PYENV_DIR, process.platform === 'win32' ? join('Scripts', 'python.exe') : join('bin', 'python'))
 
@@ -103,11 +102,12 @@ export async function installEdge(log) {
 }
 
 async function findOrFetchUv(log) {
-  if (process.env.AURACHAT_UV) return process.env.AURACHAT_UV
+  if (process.env.AURALIFE_UV) return process.env.AURALIFE_UV
   if ((await run('uv', ['--version'], { timeoutMs: 15000 })).code === 0) return 'uv'
   const bin = join(dirname(PYENV_DIR), 'bin')
   const local = join(bin, process.platform === 'win32' ? 'uv.exe' : 'uv')
-  for (const p of [local, join('C:\\AuraChat', 'rvc', 'bin', 'uv.exe'), join(homedir(), 'AuraChat', 'rvc', 'bin', 'uv.exe'), join(homedir(), 'AuraChat', 'rvc', 'bin', 'uv')]) if (existsSync(p)) return p
+  const uvExe = process.platform === 'win32' ? 'uv.exe' : 'uv'
+  for (const p of [local, join(homedir(), 'AuraLife', 'rvc', 'bin', uvExe)]) if (existsSync(p)) return p
   log?.info('下载 uv …')
   mkdirSync(bin, { recursive: true })
 

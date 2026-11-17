@@ -101,6 +101,7 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
       text: (summary ? '上一版摘要：' + summary + '\n\n' : '') + transcript,
       maxTokens: 1500,
       temperature: 0.2,
+      preferLowEffort: true, // 只输出内部 JSON：别让思考 token 吃光正文预算
     })
 
     const obj = String(out || '').match(/\{[\s\S]*\}/)

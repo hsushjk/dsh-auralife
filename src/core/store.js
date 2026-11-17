@@ -1,5 +1,5 @@
 // —— 数据目录与 JSON 持久化（AuraLife 自己写的实现，2026-11 重写）——// 所有可写数据都放在 DSH 的插件数据目录下：
-//   <DSH_HOME>/plugins-data/auralife/…（可用 AURACHAT_DATA_DIR 覆盖，测试用）
+//   <DSH_HOME>/plugins-data/auralife/…（可用 AURALIFE_DATA_DIR 覆盖，测试用）
 import { readFileSync, writeFileSync, mkdirSync, unlinkSync, openSync, closeSync, existsSync, renameSync, copyFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -8,7 +8,7 @@ const osHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
 
 let cachedBase = null
 function pluginDataBase() {
-  if (cachedBase === null) cachedBase = process.env.AURACHAT_DATA_DIR || join(osHome(), 'plugins-data', 'auralife')
+  if (cachedBase === null) cachedBase = process.env.AURALIFE_DATA_DIR || join(osHome(), 'plugins-data', 'auralife')
   return cachedBase
 }
 
