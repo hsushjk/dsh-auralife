@@ -346,7 +346,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
 
   // 过期清理：整片比 keepDays 还旧就删掉（连带这片的媒体文件），
   // 再顺手扫一遍 media 目录里过期/没人要的文件。
-  // 注意：sweep / splitCurrent / finalize / archiveChat 都会重写 index、删段文件，
+  // 注意：sweep / splitCurrent / finalize 都会重写 index、删段文件，
   // 必须和 append/patchLast 用同一把 `hist-<chatId>` 锁，否则会拿旧 index 覆盖新段 / 删掉刚写进去的消息。
   function sweepLocked(chatId) {
     const days = keepDays()
@@ -527,74 +527,6 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return { segments: idx.segments.length, messages: totalOf(chatId), textBytes: bytes, mediaBytes }
   }
 
-  // 上下文轮换用把该 chat 的全部 seg 原文挪进 archive-<时间戳>/ 子目录，
-  // 再重置 index.json —— 之后 stats() 只数新会话的消息，老对话作为本地归档保留。
-  // rebuildIndex 只扫 chatDir 一层（不过滤子目录，目录本身不会被 .json 过滤命中），归档不会被误收。
-  function archiveChatLocked(chatId) {
-    const idx = readIndex(chatId)
-    if (!idx.segments.length) return 0
-    const stamp = Date.now()
-    const dest = join(chatDir(chatId), 'archive-' + stamp)
-    try { mkdirSync(dest, { recursive: true }) } catch { return 0 }
-    let moved = 0
-    for (const seg of idx.segments) {
-      try { renameSync(segFile(chatId, seg.id), join(dest, safeName(seg.id) + '.json')); moved++ } catch {}
-    }
-    try { renameSync(indexFile(chatId), join(dest, 'index.json')) } catch {}
-    try { writeJson(indexFile(chatId), emptyIndex(chatId)) } catch {}
-    return moved
-  }
-
-  // 留给「手动清空历史」场景；上下文轮换不再调用它（ffc4e21 之后轮换只换 session）。
-  const archiveChat = (chatId) => lockAndRun(lockId(chatId), () => archiveChatLocked(chatId), histLock)
-
-
-  // ---- 历史归档（上下文轮换后的旧对话，只读）----
-  // archiveChat 把旧 seg 原文挪进 chats/<chatId>/archive-<时间戳>/，这里做只读列表/查看。
-  function listArchives(chatId) {
-    let names = []
-    try { names = readdirSync(chatDir(chatId)).filter((n) => /^archive-\d+$/.test(n)) } catch { return [] }
-    names.sort((a, b) => Number(b.replace('archive-', '')) - Number(a.replace('archive-', '')))
-    return names.map((name) => {
-      const dir = join(chatDir(chatId), name)
-      let files = []
-      try { files = readdirSync(dir).filter((f) => f.endsWith('.json') && f !== 'index.json').sort() } catch {}
-      let count = 0
-      let from = 0
-      let to = 0
-      for (const f of files) {
-        const data = readJson(join(dir, f), null)
-        const msgs = data && Array.isArray(data.messages) ? data.messages : []
-        if (!msgs.length) continue
-        count += msgs.length
-        const first = Number(msgs[0].t) || 0
-        const last = Number(msgs[msgs.length - 1].t) || 0
-        if (first && (!from || first < from)) from = first
-        if (last > to) to = last
-      }
-      return { dir: name, at: Number(name.replace('archive-', '')) || 0, count, from, to }
-    })
-  }
-
-  function readArchive(chatId, dirName) {
-    const name = String(dirName || '')
-    if (!/^archive-\d+$/.test(name)) return { ok: false, reason: '没有这个归档' }
-    const dir = join(chatDir(chatId), name)
-    if (!existsSync(dir)) return { ok: false, reason: '没有这个归档' }
-    let files = []
-    try { files = readdirSync(dir).filter((f) => f.endsWith('.json') && f !== 'index.json').sort() } catch {}
-    const messages = []
-    for (const f of files) {
-      const data = readJson(join(dir, f), null)
-      if (data && Array.isArray(data.messages)) messages.push(...data.messages)
-    }
-    messages.sort((a, b) => (Number(a.t) || 0) - (Number(b.t) || 0))
-    const total = messages.length
-    // 只读查看，不续聊：一次最多给 500 条，够看个大概。
-    return { ok: true, dir: name, total, messages: messages.slice(Math.max(0, total - 500)) }
-  }
-
-
   // 早期轮换把 seg/index 整份 rename 进 archive-*，导致「查看更早的记录」断档。
   // 这里把归档分片合并回主历史：按 t 重排、按 id 去重、重新分片，成功后删 archive-*。
   // 在 hist-<chatId> 锁内执行，和 append/sweep 串行。
@@ -680,7 +612,6 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     append, patchLast, page, pageFile, recent, last, oldestAt, totalOf,
     bytesSince, restoreArchives,
     sweep, sweepAll, touch, finalize, splitCurrent, closeAll, stats, reapOrphanMedia,
-    saveMedia, mediaPath: mediaFile, mediaDir, chatDir, archiveChat, purgeChat,
-    listArchives, readArchive,
+    saveMedia, mediaPath: mediaFile, mediaDir, chatDir, purgeChat,
   }
 }

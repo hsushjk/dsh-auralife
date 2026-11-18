@@ -290,14 +290,6 @@ export function createHub({
     return history.pageFile(chatId, opts)
   }
 
-  // 历史归档（只读）：上下文轮换后的旧对话，列表 + 查看，不做续聊。
-  function listArchives(chatId) {
-    try { return history.listArchives(chatId) } catch { return [] }
-  }
-  function readArchive(chatId, dir) {
-    try { return history.readArchive(chatId, dir) } catch (error) { return { ok: false, reason: error?.message || '读不到归档' } }
-  }
-
   function historyStats(chatId) {
     return history.stats(chatId)
   }
@@ -1156,8 +1148,6 @@ export function createHub({
     pageOf,
     pageFileOf,
     historyStats,
-    listArchives,
-    readArchive,
     cleanupVoice,
     takePendingReply,
     clearPendingReply,

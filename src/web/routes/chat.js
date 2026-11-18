@@ -81,18 +81,4 @@ export function register(router, ctx) {
     hub.noteTyping?.(chatIdOf(me.subject), Boolean(b.typing))
     return json(res, { ok: true })
   })
-  // 历史归档（上下文轮换后的旧对话）：只读列表 + 只读查看，不做续聊。
-  router.add('GET', 'api/archives', async (req, res) => {
-    const me = requireUser(req, res); if (!me) return
-    const chatId = chatIdOf(me.subject)
-    return json(res, { ok: true, archives: hub.listArchives(chatId) })
-  })
-
-  router.prefix('GET', 'api/archive/', async (req, res, url, p) => {
-    const me = requireUser(req, res); if (!me) return
-    const chatId = chatIdOf(me.subject)
-    const dir = decodeURIComponent(p.slice('api/archive/'.length))
-    return json(res, hub.readArchive(chatId, dir))
-  })
-
 }

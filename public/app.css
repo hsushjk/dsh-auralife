@@ -175,8 +175,6 @@ button:disabled { opacity: .55; cursor: default; }
 .chat-head .name { font-weight: 600; }
 .chat-head .tag { color: var(--muted); font-size: 12px; }
 .chat-head .avatar { margin-left: auto; }
-.chat-head .hist-btn { margin-left: auto; }
-.chat-head .hist-btn + .avatar { margin-left: 0; }
 .msgs { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
 /* 「查看更早的记录」永远钉在列表最上面 */
 .more-history {
