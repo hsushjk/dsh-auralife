@@ -1,7 +1,7 @@
 // web/routes/memory.js — 记忆 v2 面板路由。
 // 暴露真实的 v2 结构：事实（含版本链）/ 事件 / 联想 / 自我 / 整理。
 // 旧的 profiles/insights/styles（档案/相处经验/说话方式）已随 v1 退休，不再暴露。
-import { dataDir, readJson, writeJson, ensureDir, withFileLock } from '../../core/store.js'
+import { dataDir, readJson, writeJson, ensureDir, lockAndRun } from '../../core/store.js'
 export function register(router, ctx) {
   const { json, readBody, requireUser, requireOwner } = ctx
   const { memory, self, organHost } = ctx.deps
@@ -90,7 +90,7 @@ export function register(router, ctx) {
     const org = String(b.org || '')
     if (!organHost.list().some((o) => o.id === org)) return json(res, { ok: false, message: '没有这个器官' })
     ensureDir(dataDir('organs', 'self-made', org))
-    await withFileLock(`organ-cfg-${org}`, () => {
+    await lockAndRun(`organ-cfg-${org}`, () => {
       writeJson(dataDir('organs', 'self-made', org, 'cfg.json'), b.values || {})
     }, { staleMs: 10000, timeoutMs: 5000 })
     return json(res, { ok: true })

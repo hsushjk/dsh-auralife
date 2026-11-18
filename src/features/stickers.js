@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 import { imageSize, mimeOf, stickerSizeOk, isAnimated } from '../core/image.js'
 import { askModel } from '../core/llm.js'
 
@@ -104,7 +104,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
     const { width, height } = imageSize(buf)
     const item = { md5, file: `manual-${md5}.${ext(mime)}`, name: String(name).slice(0, 12), tags, from, at: Date.now(), width, height, bytes: buf.length }
     // 判重 + 写文件 + push + save 必须在同一把锁里，否则双进程并发收图会各写各的索引（#42）。
-    const added = await withFileLock('sticker-lib', () => {
+    const added = await lockAndRun('sticker-lib', () => {
       const lib = loadLibrary()
       const exist = lib.items.find((i) => i.md5 === md5)
       if (exist) return { existed: true, item: exist }
@@ -119,7 +119,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
     await trim()
     if (getConfig().stickers.caption && !item.name) {
       caption(buf, mime, hint).then(async ({ name: capName, tags: capTags }) => {
-        await withFileLock('sticker-lib', () => {
+        await lockAndRun('sticker-lib', () => {
           const l = loadLibrary()
           const it = l.items.find((i) => i.md5 === md5)
           if (!it) return
@@ -147,7 +147,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
 
   function markUsed(md5) {
     // 多进程下 library 的读-改-写要进锁（审计：无锁 RMW）。锁现在是异步的，这里 fire-and-forget 但要接住错误。
-    withFileLock('sticker-lib', () => {
+    lockAndRun('sticker-lib', () => {
       const lib = loadLibrary()
       const it = lib.items.find((i) => i.md5 === md5)
       if (!it) return
@@ -158,7 +158,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
   }
 
   async function remove(md5) {
-    return withFileLock('sticker-lib', () => {
+    return lockAndRun('sticker-lib', () => {
       const lib = loadLibrary()
       const it = lib.items.find((i) => i.md5 === md5)
       if (!it) return { ok: false, reason: '没有这张' }
@@ -170,7 +170,7 @@ export function createStickerStore({ dsh, getConfig, log }) {
   }
 
   function rename(md5, name, tags) {
-    return withFileLock('sticker-lib', () => {
+    return lockAndRun('sticker-lib', () => {
       const lib = loadLibrary()
       const it = lib.items.find((i) => i.md5 === md5)
       if (!it) return { ok: false }

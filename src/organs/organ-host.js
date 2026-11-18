@@ -22,7 +22,7 @@ import { readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
-import { dataDir, readJson, writeJson, ensureDir, existsSync, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, ensureDir, existsSync, lockAndRun } from '../core/store.js'
 import { guardOrgan } from './organ-guard.js'
 import { createOrganAudit, clip } from './organ-audit.js'
 import { askModel } from '../core/llm.js'
@@ -217,7 +217,7 @@ export function createOrganHost({ dsh, getConfig, log }) {
       if (!key || key.includes('/') || key.includes('\\') || key.includes('..')) {
         throw new Error('store key 不合法（不允许路径分隔符）')
       }
-      await withFileLock(`organ-store-${organId}`, () => {
+      await lockAndRun(`organ-store-${organId}`, () => {
         ensureDir(dataDir('organs', organId))
         writeJson(dataDir('organs', organId, `${key}.json`), a.value ?? null)
       }, { staleMs: 10000, timeoutMs: 5000 })

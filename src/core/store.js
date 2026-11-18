@@ -75,6 +75,7 @@ export { existsSync }
 // 等锁用 await sleep 让出事件循环（同步自旋 Atomics.wait 会把整个 DSH 进程卡住几秒）。
 // fn 可以是同步函数也可以是 async 函数：返回值原样返回，抛错原样抛出，
 // 但无论走哪条路，心跳 interval 和锁文件都在 finally 里释放。
+// 名字带 Run 是有意的（E）：它返回 Promise，调用方忘了 await 就白拿锁，而且不报错。
 const lockFileFor = (name) => dataDir('locks', `${name}.lock.json`)
 // 等锁的让出：不能 unref——调用方正在 await 这把锁，把定时器 unref 掉会让事件循环在
 // 「只剩等锁」时直接空掉（Node 会报 unsettled top-level await / 进程提前退出）。
@@ -103,7 +104,7 @@ function tryAcquireFileLock(lockFile, staleMs) {
   }
 }
 
-export async function withFileLock(name, fn, opts = {}) {
+export async function lockAndRun(name, fn, opts = {}) {
   const { staleMs = 15000, timeoutMs = 8000, spinMs = 15 } = opts
   const lockFile = lockFileFor(name)
   const giveUpAt = Date.now() + timeoutMs
@@ -116,7 +117,7 @@ export async function withFileLock(name, fn, opts = {}) {
     if (fd !== null) break
     const left = giveUpAt - Date.now()
     if (left <= 0) {
-      throw new Error(`withFileLock: 拿不到锁 ${name}（${Math.round(timeoutMs / 1000)} 秒超时，可能别的进程卡死）`)
+      throw new Error(`lockAndRun: 拿不到锁 ${name}（${Math.round(timeoutMs / 1000)} 秒超时，可能别的进程卡死）`)
     }
     // 关键：异步等锁。以前是 Atomics.wait 同步自旋，一次锁冲突能冻住整个事件循环 8 秒。
     await lockSleep(Math.min(waitMs, left))

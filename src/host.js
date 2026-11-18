@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { createLogger } from './core/logger.js'
-import { writeJson, dataDir, withFileLock } from './core/store.js'
+import { writeJson, dataDir, lockAndRun } from './core/store.js'
 import { loadConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
 import { createStickerStore } from './features/stickers.js'
 import { scoreText, judgeChem } from './features/companion.js'
@@ -61,7 +61,7 @@ export function apply(ctx) {
     cfg = mergeFromPanel(cfg, patch) // 本进程立即生效
     maxLogMB = Number(cfg.logs?.maxMB) || 2
     configSaveChain = configSaveChain
-      .then(() => withFileLock('config', () => {
+      .then(() => lockAndRun('config', () => {
         const disk = loadConfig()
         const merged = mergeFromPanel(disk, patch)
         saveConfig(merged)

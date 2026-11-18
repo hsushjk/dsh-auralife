@@ -2,7 +2,7 @@
 // Slice 0 只落地「状态容器 + 派生」，不接线：companion.js / selfdrive.js 仍读各自旧文件，
 // 迁移与接入在 Slice 1（wishes+drive）之后进行。因此本模块绝不 touch mood.json / selfdrive.md。
 
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 
 export function stateFile() {
   return dataDir('state.json')
@@ -131,7 +131,7 @@ export function createLife({ getConfig, log }) {
   // update() 在文件锁里重新读盘、应用改动、写回——所有改 state 的入口都走它（审计发现的最高风险点）。
   // update() 在文件锁里重新读盘、应用改动、写回；fn 允许 async（内部要 await 别的异步操作时用）。
   async function update(fn) {
-    return withFileLock('state', async () => {
+    return lockAndRun('state', async () => {
       const s = load()
       const out = await fn(s)
       save(s)

@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 
 const usersFile = () => dataDir('users.json')
 const sessionsFile = () => dataDir('web-sessions.json')
@@ -27,7 +27,7 @@ function saveSessions(s) {
 // 写操作统一进锁（读保持同步：writeJson 是原子替换，读到的永远是完整文件）。
 const SESSIONS_LOCK = { staleMs: 10000, timeoutMs: 8000 }
 async function updateSessions(mutator) {
-  return withFileLock('web-sessions', () => {
+  return lockAndRun('web-sessions', () => {
     const s = loadSessions()
     const out = mutator(s)
     saveSessions(s)
@@ -39,7 +39,7 @@ async function updateSessions(mutator) {
 // 两个进程同时建客人/改权限会互相盖掉。所有写操作统一进锁。
 const USERS_LOCK = { staleMs: 10000, timeoutMs: 8000 }
 async function updateUsers(mutator) {
-  return withFileLock('web-users', () => {
+  return lockAndRun('web-users', () => {
     const u = loadUsers()
     const out = mutator(u)
     saveUsers(u)

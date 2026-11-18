@@ -8,7 +8,7 @@
 // 提供同签名兼容垫片（profiles/insights/styles 落到 mem/archive.json）。
 import { readdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { dataDir, numOr, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, numOr, readJson, writeJson, lockAndRun } from '../core/store.js'
 import { createMemStore } from './store.js'
 import { createRecall } from './recall.js'
 import { createReceipt } from './receipt.js'
@@ -141,7 +141,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
   async function consolidateRun() {
     let jobs = []
     try {
-      jobs = await withFileLock('memory-tick', () => {
+      jobs = await lockAndRun('memory-tick', () => {
         const runs = loadRuns()
         const claims = Object.fromEntries(
           Object.entries(runs.consolidateClaims || {})
@@ -192,7 +192,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
         superseded += res.facts.superseded
         episodes += res.episodes.length
         factIds.push(...(res.facts.addedIds || []), ...(res.facts.supersededIds || []))
-        await withFileLock('memory-tick', () => {
+        await lockAndRun('memory-tick', () => {
           const wm = loadWatermark()
           wm[job.chatId] = Math.max(Number(wm[job.chatId]) || 0, ...job.fresh.map((m) => m.t))
           saveWatermark(wm)
@@ -203,7 +203,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
       } catch (error) {
         log.warn(`记忆编码（${job.chatId}）失败：`, error.message)
         try {
-          await withFileLock('memory-tick', () => {
+          await lockAndRun('memory-tick', () => {
             const runs = loadRuns()
             if (runs.consolidateClaims) delete runs.consolidateClaims[job.chatId]
             saveRuns(runs)
@@ -218,7 +218,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
       const runs = loadRuns()
       if (Date.now() - (Number(runs.lastKindFixAt) || 0) > 24 * 3600_000) {
         const fixed = await encode.fixKinds({ limit: 20 })
-        await withFileLock('memory-tick', () => {
+        await lockAndRun('memory-tick', () => {
           const r2 = loadRuns()
           r2.lastKindFixAt = Date.now()
           if (fixed > 0) r2.lastKindFixed = Number(r2.lastKindFixed || 0) + fixed
@@ -233,7 +233,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
     const verify = receipt.verifyFacts(factIds)
     const state = factIds.length ? (verify.missing.length ? 'missing' : 'found') : 'found'
     try {
-      await withFileLock('memory-tick', () => {
+      await lockAndRun('memory-tick', () => {
         const runs = loadRuns()
         runs.lastConsolidate = { day: dayKey(), at: Date.now(), added, superseded, episodes, receipt: state }
         saveRuns(runs)
@@ -272,7 +272,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
         const replayReport = await replay.run({ now: Date.now() })
         // #7：replay 跑几十秒，期间别的进程可能已经改了 runs.json（consolidate 记录、claim、lastKindFixAt）。
         // 用旧快照整份 save 会把这些全盖掉——锁内重新读，只合并 lastReplay 一个字段。
-        await withFileLock('memory-tick', () => {
+        await lockAndRun('memory-tick', () => {
           const fresh = loadRuns()
           fresh.lastReplay = { day: today, at: Date.now(), edges: replayReport.edgesAdded, forgotten: replayReport.forgotten }
           saveRuns(fresh)

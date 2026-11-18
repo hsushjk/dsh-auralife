@@ -1,4 +1,4 @@
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 import { isSilence, stripMarkdown } from '../chat/reply.js'
 
 const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -79,7 +79,7 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
   // 生成失败/空回复：把认领的 id 退回去，下一轮还会再试（#40）。
   async function releaseClaims(task) {
     try {
-      await withFileLock('azone-social', () => {
+      await lockAndRun('azone-social', () => {
         const s = load()
         const cur = new Set(s.replied[task.key] || [])
         for (const id of task.ids) cur.delete(id)
@@ -120,7 +120,7 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
       // 第三段（锁内）：写回记录；失败/空回复退回认领（#40/#41）。
       let tasks = []
       try {
-        tasks = await withFileLock('azone-social', () => {
+        tasks = await lockAndRun('azone-social', () => {
           const s = load()
           if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), count: 0 })
           s.lastRun = Date.now()
@@ -148,7 +148,7 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
           continue
         }
         try {
-          await withFileLock('azone-social', () => {
+          await lockAndRun('azone-social', () => {
             const s = load()
             if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), count: 0 })
             commitTask(task, text, s)

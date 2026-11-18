@@ -4,7 +4,7 @@
 // 冲动够高且醒着才开口。压力本身就是动态触发器，由 AI 判断。
 // 静默期 = 她自己的作息（state.rhythm），可随作息自动调节（tools.js web_set_rhythm / 她聊到就改）。
 
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 import { inRange } from '../core/time.js'
 import { askModel } from '../core/llm.js'
 import { OWNER_ID } from '../chat/access.js'
@@ -94,7 +94,7 @@ export function createDrive({ getConfig, hub, log, life, wishes, memory, chemist
   const save = (s) => writeJson(file(), s)
   // 多进程锁：DSH 每个进程都跑 drive 心跳，load→改→save 会互相覆盖、双开口。
   // 锁内重读盘再改再写。staleMs 放宽到 2 分钟：评估冲动要调 LLM，可能比默认 15s 久。
-  const update = (fn) => withFileLock('drive', async () => {
+  const update = (fn) => lockAndRun('drive', async () => {
     const s = load()
     const out = await fn(s)
     save(s) // 必须等 fn 落定再写：评估这类带 await 的改动，否则改完还没落盘就 save 了

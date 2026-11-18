@@ -12,7 +12,7 @@
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { dataDir, ensureDir, numOr, withFileLock } from '../core/store.js'
+import { dataDir, ensureDir, numOr, lockAndRun } from '../core/store.js'
 import { inferKind } from './similar.js'
 
 export const monthKey = (t = Date.now()) => {
@@ -158,7 +158,7 @@ export function createMemStore({ log = console } = {}) {
   // 命中仅更新 hits/lastSeen，不动 t0（修 memory.js:160 的 bug）
   // 多进程下 find→append 的读-改-写进锁（审计：无锁 RMW）。
   function bumpHit(id, now = Date.now()) {
-    return withFileLock('mem-facts', () => {
+    return lockAndRun('mem-facts', () => {
       // 锁内读之前先丢掉进程缓存：all() 的 cache 只有本进程 append 时才失效，
       // 别的进程刚写的新事实/新计数会被旧缓存整份覆盖回去（#14）。
       invalidate()
@@ -175,7 +175,7 @@ export function createMemStore({ log = console } = {}) {
   // 遗忘：append 一行 invalidAt 墓碑（旧行不改，last-wins 后 isCurrent 判失效）。
   // 只在重放（replay.js）发生；硬档（archived）永不遗忘。
   function forget(id, now = Date.now()) {
-    return withFileLock('mem-facts', () => {
+    return lockAndRun('mem-facts', () => {
       invalidate()
       const f = findFact(id)
       if (!f || f.invalidAt) return false
@@ -186,7 +186,7 @@ export function createMemStore({ log = console } = {}) {
 
   // 追加新事实并让 `supersedes` 指向旧 id（旧行不改，天然版本链）
   function supersede(oldId, patch) {
-    return withFileLock('mem-facts', () => {
+    return lockAndRun('mem-facts', () => {
       invalidate()
       const old = findFact(oldId)
       const fact = addFact({
@@ -203,7 +203,7 @@ export function createMemStore({ log = console } = {}) {
   // 把某条事实挂到一个 episode 上（证据链：这条记忆来自哪段经历）。
   // append 一行带新 ev 的同一 id（last-wins），旧行不改；幂等（去重）。
   function linkEvidence(factId, episodeId) {
-    return withFileLock('mem-facts', () => {
+    return lockAndRun('mem-facts', () => {
       invalidate()
       const f = findFact(factId)
       if (!f) return false
@@ -217,7 +217,7 @@ export function createMemStore({ log = console } = {}) {
   // 纠正事实类型（#2）：抽取时模型给了明确 kind、旧记忆却是正则兜底猜出来的，
   // 就在同一 id 上追加一行修正记录（last-wins，审计留痕）。
   function setFactKind(id, kind) {
-    return withFileLock('mem-facts', () => {
+    return lockAndRun('mem-facts', () => {
       invalidate()
       const f = findFact(id)
       if (!f) return false
@@ -232,7 +232,7 @@ export function createMemStore({ log = console } = {}) {
 
   // 标记「这条事实最近被主动想起/说过」（防同一句反复被忽然想起）。
   function markSpoken(id, now = Date.now()) {
-    return withFileLock('mem-facts', () => {
+    return lockAndRun('mem-facts', () => {
       invalidate()
       const f = findFact(id)
       if (!f) return false
@@ -243,7 +243,7 @@ export function createMemStore({ log = console } = {}) {
 
   // 标记「这条事实刚被审计过」（防状态型事实每天都被复审、天天烧模型）。
   function markAudited(id, now = Date.now()) {
-    return withFileLock('mem-facts', () => {
+    return lockAndRun('mem-facts', () => {
       invalidate()
       const f = findFact(id)
       if (!f) return false

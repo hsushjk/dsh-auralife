@@ -5,7 +5,7 @@
 //     已迁过（id 已在 store）的就跳过，所以重复跑只补增量、不重复。
 //   - profiles / insights / styles → mem/archive.json（硬档：人物小档案 + 相处经验 + 说话方式）。
 //   - 不删 memories.json（旧 memory.js 还在跑，Slice 3/4 切完后才退休改名 .bak）。
-import { dataDir, numOr, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, numOr, readJson, writeJson, lockAndRun } from '../core/store.js'
 import { isHardFact } from './similar.js'
 
 const SRC_MAP = {
@@ -15,7 +15,7 @@ const SRC_MAP = {
 
 export function migrateLegacy({ store, log = console } = {}) {
   // 多进程下每个进程启动都会跑迁移，进锁防重复写（幂等本可兜底，锁让首次迁移不并发）。
-  return withFileLock('mem-migrate', () => {
+  return lockAndRun('mem-migrate', () => {
   const legacy = readJson(dataDir('memories.json'), null)
   if (!legacy || !Array.isArray(legacy.items)) return { migrated: 0, archive: [] }
 

@@ -9,7 +9,7 @@
 import { recallability } from './recall.js'
 import { similarity } from './similar.js'
 import { createAssess } from './assess.js'
-import { numOr, withFileLock } from '../core/store.js'
+import { numOr, lockAndRun } from '../core/store.js'
 
 // 遗忘阈值：recallability 低于此值且非硬档 → 忘掉。
 // recallability = exp(-days / tau)，tau = 20×strength×(0.5+conf)。
@@ -119,7 +119,7 @@ export function createReplay({ store, life, self, dsh, getConfig, log = console 
   // 主入口：重放一轮 = 建边 + 遗忘 + 认知审计 + 提炼 self + 读回自证。
   // 锁进公共入口：tick 与 debug 面板都能直接调 run，跨进程同一时刻只允许一个在重放。
   function run({ now = Date.now() } = {}) {
-    return withFileLock('memory-tick', async () => {
+    return lockAndRun('memory-tick', async () => {
       const before = store.stats()
       const edges = buildEdges(now)
       const forgotten = await forget(now)

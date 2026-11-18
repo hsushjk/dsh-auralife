@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 import { mimeOf } from '../core/image.js'
 
 export const SEGMENT_LIMIT = 100
@@ -180,7 +180,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
 
   async function append(chatId, payload) {
     // 多进程下 DSH 每个进程都跑一份插件，append/patchLast 的读-改-写必须进锁，否则并发丢消息。
-    return withFileLock(`hist-${chatId}`, () => {
+    return lockAndRun(`hist-${chatId}`, () => {
       const msg = extractMedia(chatId, { id: randomUUID(), t: Date.now(), ...payload })
       const idx = readIndex(chatId)
       let seg = idx.segments[idx.segments.length - 1]
@@ -213,7 +213,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
   }
 
   async function patchLast(chatId, patch) {
-    return withFileLock(`hist-${chatId}`, () => {
+    return lockAndRun(`hist-${chatId}`, () => {
       const idx = readIndex(chatId)
       const seg = idx.segments[idx.segments.length - 1]
       if (!seg) return null
@@ -410,7 +410,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
   // 必须和 append/sweep/archive 用同一把 hist-<chatId> 锁：否则删除期间正有一条消息在写，
   // 要么 append 撞 ENOENT 静默丢消息，要么删完又凭空建出目录（删不干净）。
   function purgeChat(chatId) {
-    return withFileLock(lockId(chatId), () => {
+    return lockAndRun(lockId(chatId), () => {
       const t = timers.get(chatId)
       if (t) { clearTimeout(t); timers.delete(chatId) }
       let removed = 0
@@ -425,7 +425,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
   const histLock = { staleMs: 10000, timeoutMs: 20000 }
 
   function sweep(chatId) {
-    return withFileLock(lockId(chatId), () => sweepLocked(chatId), histLock)
+    return lockAndRun(lockId(chatId), () => sweepLocked(chatId), histLock)
   }
 
   async function sweepAll() {
@@ -473,13 +473,13 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return made
   }
 
-  const splitCurrent = (chatId) => withFileLock(lockId(chatId), () => splitCurrentLocked(chatId), histLock)
+  const splitCurrent = (chatId) => lockAndRun(lockId(chatId), () => splitCurrentLocked(chatId), histLock)
 
   // 空闲处理：先裁切，再清过期片，有删除就通知客户端新的边界。
   // 两个动作在同一把锁内完成，保证和 append 互斥；调用方需要 await / catch。
   async function finalize(chatId) {
     timers.delete(chatId)
-    return withFileLock(lockId(chatId), () => {
+    return lockAndRun(lockId(chatId), () => {
       let split = null
       try { split = splitCurrentLocked(chatId) } catch (e) { log.warn?.('空闲裁切出错：' + e.message) }
       const r = sweepLocked(chatId)
@@ -545,7 +545,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return moved
   }
 
-  const archiveChat = (chatId) => withFileLock(lockId(chatId), () => archiveChatLocked(chatId), histLock)
+  const archiveChat = (chatId) => lockAndRun(lockId(chatId), () => archiveChatLocked(chatId), histLock)
 
 
   // ---- 历史归档（上下文轮换后的旧对话，只读）----

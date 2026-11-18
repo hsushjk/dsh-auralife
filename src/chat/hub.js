@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, appendFileSync, readdirSync, unlinkSync, write
 import { readFile, writeFile, readdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 import { parseReply, bubbleDelay } from './reply.js'
 import { levelFor, presetForChat, isOwner, OWNER_ID } from './access.js'
 import { fetchImage } from '../core/net.js'
@@ -85,7 +85,7 @@ export function createHub({
       if (statsPending[k] === pending[k]) delete statsPending[k]
       else statsPending[k] -= pending[k]
     }
-    return withFileLock('stats', async () => {
+    return lockAndRun('stats', async () => {
       const saved = readJson(statsFile(), () => null)
       const base = { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0 }
       if (saved && typeof saved === 'object') for (const k of Object.keys(base)) base[k] = Number(saved[k]) || 0
@@ -138,7 +138,7 @@ export function createHub({
   // 以前是「锁外读快照、只锁写」，两个进程同时开新会话时后写的那个会用旧快照覆盖掉前一个，
   // 映射一丢就落到重建会话。所有写入口都必须 await 这个函数。
   function updateMap(mutator, opts = {}) {
-    return withFileLock('sessions', () => {
+    return lockAndRun('sessions', () => {
       const m = readJson(sessionsFile(), () => ({ chats: {} }))
       if (!m || typeof m !== 'object') throw new Error('sessions.json 内容异常')
       if (!m.chats || typeof m.chats !== 'object') m.chats = {}
@@ -223,7 +223,7 @@ export function createHub({
     const line = JSON.stringify({ t: new Date().toISOString(), chatId, who, text, ...(uid ? { uid } : {}) })
     mkdirSync(chatlogDir(), { recursive: true })
     // 和「删客人时的 chatlog 过滤重写」共用一把 lock：否则重写期间新追加的行会被整份覆盖掉。
-    return withFileLock('chatlog', () => appendFileSync(join(chatlogDir(), `${day}.jsonl`), line + '\n'), { staleMs: 10000, timeoutMs: 5000 })
+    return lockAndRun('chatlog', () => appendFileSync(join(chatlogDir(), `${day}.jsonl`), line + '\n'), { staleMs: 10000, timeoutMs: 5000 })
       .catch((error) => log.warn('对话日志写失败：' + (error?.message || error)))
   }
 
@@ -816,7 +816,7 @@ export function createHub({
       return p
     }
     try {
-      return await withFileLock('pending-reply', () => {
+      return await lockAndRun('pending-reply', () => {
         const disk = readJson(pendingFile(), () => null)
         const p = usable(disk) || usable(pendingReply)
         if (!p) {
@@ -1035,7 +1035,7 @@ export function createHub({
     let chatlog = 0
     try {
       // chatlog 正常写入也走这把锁；这里用 fs/promises + 临时文件 rename，避免几 MB 日志卡住事件循环。
-      await withFileLock('chatlog', async () => {
+      await lockAndRun('chatlog', async () => {
         const dir = chatlogDir()
         let names = []
         try { names = (await readdir(dir)).filter((n) => n.endsWith('.jsonl')) } catch { return }

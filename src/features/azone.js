@@ -1,4 +1,4 @@
-import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
 
 const toMin = (hhmm) => {
   const [h, m] = String(hhmm).split(':').map(Number)
@@ -20,7 +20,7 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
   const state = () => readJson(file(), () => ({ triggers: { day: '', idle: [], event: [] }, history: [] }))
   const save = (s) => writeJson(file(), s)
   // 多进程锁：多进程心跳会同时判「闲着该写日记」→ 重复写。RMW 走锁（异步，不阻塞事件循环）。
-  const update = async (fn) => withFileLock('diary', async () => {
+  const update = async (fn) => lockAndRun('diary', async () => {
     const s = state()
     const out = await fn(s)
     save(s)
