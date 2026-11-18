@@ -951,9 +951,11 @@ export function createHub({
     try {
       await agent.followup({ id: randomUUID(), role: 'user', content: admitted, source: { kind: SOURCE_KIND } })
       await dsh.sessions.flush(agent.session)
-    } finally {
-      // #15：followup 抛错也要收掉「正在输入…」，否则前端一直转圈到本地超时。
+    } catch (error) {
+      // #15：followup 真抛错才收掉「正在输入…」；正常一轮要等 turn/end 再收。
+      // （7cafde1 曾在这里用 finally 立即收——followup 返回时模型还没回，前端一闪就没了。）
       stopTyping(chat.chatId)
+      throw error
     }
   }
 
