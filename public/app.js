@@ -847,10 +847,14 @@ async function connectStream() {
   let url = BASE + '/api/stream'
   try {
     const r = await api('/api/stream-ticket', { method: 'POST', body: {} })
-    if (r && r.ok && r.ticket) url += '?ticket=' + encodeURIComponent(r.ticket)
-    else url += '?token=' + encodeURIComponent(token)
+    if (!(r && r.ok && r.ticket)) throw new Error((r && r.reason) || '拿不到票据')
+    url += '?ticket=' + encodeURIComponent(r.ticket)
   } catch (err) {
-    url += '?token=' + encodeURIComponent(token)
+    // C12：不再回退 ?token=（token 不进 URL）。取票失败按断线处理，退避后重连。
+    if (!streamWasDown) { streamWasDown = true; toast('实时连接凭证获取失败，正在重试…', 'err') }
+    const wait = Math.min(30000, 1000 * Math.pow(2, Math.min(5, streamRetries++)))
+    streamRetryTimer = setTimeout(connectStream, wait)
+    return
   }
   stream = new EventSource(url)
   stream.onmessage = (e) => {
@@ -881,14 +885,14 @@ async function connectStream() {
       // 空间有新动静（Ta 回了留言等），在空间页就原地刷新，不用切页面
       if (currentView === 'diary') loadDiary()
     } else if (ev.type === 'rotate') {
-      // 上下文轮换：旧对话已归档，客户端手里的气泡还是上一轮的——不提示的话像「记录还在」，
-      // 一刷新只剩新的几条，用户会以为丢了。这里明确提示 + 重载，历史可在「历史」里翻。
+      // B9：轮换只换会话、聊天记录原地保留（不再归档）。提示不能再写「已归档」，
+      // 但仍要说明「接下来是新的一段」，否则用户会以为旧记录被清空了。
       if (!ev.chatId || !me || String(ev.chatId) === String(me.subject)) {
         if (currentView === 'chat') {
           loadMessages()
-          toast('这一段对话已经归档了，点右上角「历史」还能翻到', 'ok')
+          toast('这一段聊得有点长了，接着换新的一段继续（之前的聊天记录都还在）', 'ok')
         } else {
-          toast('刚才那段对话归档了，聊天页「历史」里能翻到', 'ok')
+          toast('刚才那段聊得长，已经换到新的一段继续', 'ok')
         }
       }
     }
@@ -910,6 +914,27 @@ async function connectStream() {
 }
 
 // 历史归档（只读）：上下文轮换把旧对话挪进了 archive-*，网页上给一个能看的地方。
+// B10：DSH 内嵌页会拦原生 confirm()（见发送确认处的注释），二次确认统一用页内弹层。
+function askConfirm(message) {
+  return new Promise((resolve) => {
+    const ov = document.createElement('div')
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:70;display:flex;align-items:center;justify-content:center;padding:20px'
+    const card = document.createElement('div')
+    card.style.cssText = 'background:var(--panel,#181a20);color:var(--text,#eee);border:1px solid var(--line,#333);border-radius:12px;max-width:420px;width:100%;padding:16px'
+    card.innerHTML = '<div class="cfm-text" style="line-height:1.7;margin-bottom:14px"></div>' +
+      '<div style="display:flex;justify-content:flex-end;gap:8px">' +
+      '<button class="tool" data-no style="padding:8px 14px;border-radius:8px">取消</button>' +
+      '<button class="tool" data-yes style="padding:8px 14px;border-radius:8px">确定</button></div>'
+    card.querySelector('.cfm-text').textContent = message
+    const done = (v) => { ov.remove(); resolve(v) }
+    card.querySelector('[data-no]').onclick = () => done(false)
+    card.querySelector('[data-yes]').onclick = () => done(true)
+    ov.addEventListener('click', (e) => { if (e.target === ov) done(false) })
+    ov.appendChild(card)
+    document.body.appendChild(ov)
+  })
+}
+
 async function openArchives() {
   const r = await api('/api/archives')
   const list = (r.ok && r.archives) || []
@@ -2088,12 +2113,13 @@ async function loadGuests() {
     if (!username) return toast('先填个用户名', 'err')
     // 默认只聊天；完全权限是建好之后主人手动点开的白名单（#44）。
     const wantLevel = $('#g-level')?.value || 'social'
-    if (wantLevel === 'full' && !confirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？（也可以先建好，再单独点开）')) return
+    if (wantLevel === 'full' && !(await askConfirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？（也可以先建好，再单独点开）'))) return
     const r2 = await api('/api/guests', { method: 'POST', body: { username, displayName: ($('#g-d')?.value || '').trim() || username, level: 'social' } })
     if (r2.ok) {
       if (wantLevel === 'full') {
         const r3 = await api('/api/guests/' + r2.subject, { method: 'PATCH', body: { level: 'full', confirm: true } })
         if (!r3.ok) toast('客人建好了，但完全权限没开成：' + (r3.reason || ''), 'err')
+        else if (r3.warning) toast(r3.warning, 'err')
       }
       toast('创建好了，一次性密码：' + r2.password)
       if (navigator.clipboard) navigator.clipboard.writeText(r2.password).catch(() => {})
@@ -2131,10 +2157,11 @@ async function loadGuests() {
     const sel = e.target.closest('[data-glevel]')
     if (!sel) return
     // 完全权限要二次确认；取消就恢复原值（#44）。
-    if (sel.value === 'full' && !confirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？')) { sel.value = 'social'; return }
+    if (sel.value === 'full' && !(await askConfirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？'))) { sel.value = 'social'; return }
     const r2 = await api('/api/guests/' + sel.dataset.glevel, { method: 'PATCH', body: { level: sel.value, confirm: true } })
-    toast(r2.ok ? '改好了' : (r2.reason || '没改成'), r2.ok ? '' : 'err')
-    if (!r2.ok) loadGuests()
+    if (r2.ok && r2.warning) toast(r2.warning, 'err')
+    else toast(r2.ok ? '改好了' : (r2.reason || '没改成'), r2.ok ? '' : 'err')
+    if (!r2.ok || r2.warning) loadGuests()
   }
 }
 

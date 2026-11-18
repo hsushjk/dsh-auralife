@@ -58,8 +58,6 @@ function extractJson(raw) {
 const NIGHTMARE_IMAGERY = /坠落|掉下|追赶|被追|逃跑|失去|丢了|找不到|黑|血|死|沉|淹|窒息|崩塌/
 
 export function createSleep({ life, energy, chemistry, dsh, getConfig, log = console, memory = () => null, drive = () => null, notify = async () => {}, writeDiary = async () => {} }) {
-  const cfg = () => getConfig().sleep || {}
-
   // 当前有效状态：state + 钟点合在一起判；tick 没跑到时也不至于卡死在 sleeping。
   function effectiveOf(s, now) {
     const sl = s.sleep

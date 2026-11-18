@@ -545,6 +545,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return moved
   }
 
+  // 留给「手动清空历史」场景；上下文轮换不再调用它（ffc4e21 之后轮换只换 session）。
   const archiveChat = (chatId) => lockAndRun(lockId(chatId), () => archiveChatLocked(chatId), histLock)
 
 

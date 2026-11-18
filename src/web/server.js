@@ -174,17 +174,15 @@ export function createWebServer({ dsh, getConfig, setConfig, publicConfig, log, 
   }
 
   function handleStream(req, res, url) {
-    // #12：优先用一次性 ticket；兼容旧页面还带 token 的情况。
+    // C12：ticket 真正一次性（用后即焚），断线重连由前端重新取票；
+    // token 不再从 URL 接受（日志/Referer 里暴露登录态）。
     let me = null
     const ticket = url.searchParams.get('ticket')
     if (ticket) {
-      // #12 回归：一次性 ticket 会打死 EventSource 的自动重连（重连 URL 里的票已被消费 → 401 → CLOSED）。
-      // 改成「60 秒内可重复使用」：票本身短命、只在本机接口用，断网/重启/休眠回来都能自愈。
       pruneTickets()
       const rec = streamTickets.get(ticket)
+      streamTickets.delete(ticket)
       if (rec && Date.now() - rec.at <= 60_000) me = { subject: rec.subject, role: rec.role, level: rec.level }
-    } else {
-      me = sessionUser(url.searchParams.get('token'))
     }
     if (!me) return send(res, 401, { ok: false, reason: '没登录' })
     const chatId = chatIdOf(me.subject)
