@@ -57,6 +57,7 @@ export function createHub({
   const busyTimers = new Map()
   const waiting = new Set()
   const usageCache = new Map() // chatId -> { t, tokens, window, ratio }
+  const usageReal = new Map() // chatId -> { t, used }（平台 assistant/message.usage 报的真实 token）
   const rotatedChats = new Map() // chatId -> { at, n }（本进程内：该 chat 已经归档转生过的次数）
   let liveWindow = 0 // DSH 平台真实窗口：session/event 里 request/context 事件带 contextWindow（如 1M）
   let liveModel = ''
@@ -178,38 +179,41 @@ export function createHub({
     const now = Date.now()
     if (!force && c && now - c.t < 10000) return c
     const win = contextWindow()
-    const tokens = Math.round(history.stats(chatId).textBytes * 0.4) + ROTATE_FIXED_TOKENS
-    const u = { t: now, tokens, window: win, ratio: Math.round((tokens / win) * 1000) / 10 }
+    const real = usageReal.get(chatId)
+    const fresh = real && now - real.t < 30 * 60_000 ? real : null
+    const tokens = fresh ? real.used : Math.round(history.stats(chatId).textBytes * 0.4) + ROTATE_FIXED_TOKENS
+    const u = { t: now, tokens, window: win, ratio: Math.round((tokens / win) * 1000) / 10, source: fresh ? 'platform' : 'estimate' }
     usageCache.set(chatId, u)
     return u
   }
 
-  // 把旧会话归档：seg 原文挪进 chats/<chatId>/archive-<时间>/（本地归档，不删），
-  // 补一条轮换日志（可审计），然后 archiveSession + 删映射 → 下一条消息 agentFor 自动开新会话。
+  // C：上下文轮换只换 session，不动聊天记录。
+  // （旧实现还会 archiveChat 把 chats/<chatId> 的 seg/index rename 走——「查看更早的记录」从此断档，
+  //  等于在 DSH 自己的截断之外又造了一套窗口管理。archive-* 只留给「手动清空历史」。）
   async function rotateIfNeeded(chat) {
     if (chat.system) return false
     const u = contextUsage(chat.chatId, true)
     if (u.tokens < u.window * ROTATE_RATIO) return false
     const prior = map().chats[chat.chatId]
-    const archiveDir = 'archive-' + Date.now()
-    await history.archiveChat(chat.chatId)
     const rec = {
       at: Date.now(),
       chatId: chat.chatId,
       tokens: u.tokens,
       window: u.window,
       ratio: u.ratio,
+      source: u.source,
       priorSessionId: (prior && prior.sessionId) || null,
       priorSessionTitle: (prior && prior.title) || '',
-      archiveDir,
     }
     const logFile = dataDir('mem', 'rotation-log.jsonl')
     try { appendFileSync(logFile, JSON.stringify(rec) + '\n') } catch {}
+    // resetChat 只做 archiveSession(prior.sessionId) + 删会话映射，聊天分片原地保留。
     await resetChat(chat.chatId)
     const r = rotatedChats.get(chat.chatId)
     rotatedChats.set(chat.chatId, { at: Date.now(), n: (r ? r.n : 0) + 1 })
     usageCache.delete(chat.chatId)
-    log.info(`上下文 ${u.ratio}%（估算 ${u.tokens}/${u.window}），旧会话已归档（${archiveDir}）并开新会话（${chat.chatId} 第 ${r ? r.n + 1 : 1} 转）`)
+    usageReal.delete(chat.chatId)
+    log.info(`上下文 ${u.ratio}%（${u.source === 'platform' ? '平台真实' : '估算'} ${u.tokens}/${u.window}），换新会话（${chat.chatId} 第 ${r ? r.n + 1 : 1} 转；聊天记录保留）`)
     emit?.('rotate', rec)
     return true
   }
@@ -623,6 +627,11 @@ export function createHub({
     if (event.type === 'assistant/message') {
       const d = event.data || {}
       if (d.interrupted) return
+      // C：平台自带本步真实 usage（inputTokens 含上下文），轮换判断用它，别再按字节数估。
+      if (d.usage) {
+        const used = Number(d.usage.totalTokens) || ((Number(d.usage.inputTokens) || 0) + (Number(d.usage.outputTokens) || 0))
+        if (Number.isFinite(used) && used > 0) usageReal.set(chatId, { t: Date.now(), used })
+      }
       const t = textOf(d.message)
       if (t) { st.lastTurn = d.turn; st.text = t }
       return
