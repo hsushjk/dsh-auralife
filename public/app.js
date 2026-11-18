@@ -560,7 +560,7 @@ function splitModelValue(v) {
 function renderChat(main) {
   main.innerHTML =
     '<div class="chat">' +
-    '<div class="chat-head"><span class="name" id="head-name"></span></div>' +
+    '<div class="chat-head"><span class="name" id="head-name"></span><button class="tool hist-btn" id="hist-btn">历史</button></div>' +
     '<div class="msgs" id="msgs"></div>' +
     '<div class="typing" id="typing"></div>' +
     '<div class="composer">' +
@@ -574,6 +574,7 @@ function renderChat(main) {
     '<input type="file" id="file-upload" multiple hidden />' +
     '</div></div>'
   $('#head-name').textContent = bot()
+  $('#hist-btn').onclick = openArchives
   $('#send').onclick = sendText
   $('#input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText() } })
   let pingTimer = null
@@ -835,8 +836,13 @@ function showFileConfirm(items, totalRaw, totalB64) {
   ov.addEventListener('click', (e2) => { if (e2.target === ov) ov.remove() })
 }
 
+let streamRetryTimer = null
+let streamRetries = 0
+let streamWasDown = false
+
 async function connectStream() {
-  if (stream) stream.close()
+  if (stream) { try { stream.close() } catch (err) {} ; stream = null }
+  if (streamRetryTimer) { clearTimeout(streamRetryTimer); streamRetryTimer = null }
   // #12：token 不进 URL。先换一张一次性 ticket，再开 EventSource；换不到才退回旧参数（兼容旧服务端）。
   let url = BASE + '/api/stream'
   try {
@@ -874,9 +880,81 @@ async function connectStream() {
     } else if (ev.type === 'azone') {
       // 空间有新动静（Ta 回了留言等），在空间页就原地刷新，不用切页面
       if (currentView === 'diary') loadDiary()
+    } else if (ev.type === 'rotate') {
+      // 上下文轮换：旧对话已归档，客户端手里的气泡还是上一轮的——不提示的话像「记录还在」，
+      // 一刷新只剩新的几条，用户会以为丢了。这里明确提示 + 重载，历史可在「历史」里翻。
+      if (!ev.chatId || !me || String(ev.chatId) === String(me.subject)) {
+        if (currentView === 'chat') {
+          loadMessages()
+          toast('这一段对话已经归档了，点右上角「历史」还能翻到', 'ok')
+        } else {
+          toast('刚才那段对话归档了，聊天页「历史」里能翻到', 'ok')
+        }
+      }
     }
   }
-  stream.onerror = () => {}
+  stream.onopen = () => {
+    if (streamWasDown) toast('连接恢复了', 'ok')
+    streamWasDown = false
+    streamRetries = 0
+  }
+  // 断线自愈：不能依赖 EventSource 自己的重连——url 里的 ticket 已被消费，重连只会 401 然后 CLOSED。
+  // 这里关掉旧连接、换新 ticket、按指数退避重连（1s→2s→4s→…最多 30s）。
+  stream.onerror = () => {
+    if (stream) { try { stream.close() } catch (err) {} ; stream = null }
+    if (!streamWasDown) { streamWasDown = true; toast('连接断了，正在自动重连…', 'err') }
+    const delay = Math.min(30000, 1000 * Math.pow(2, Math.min(5, streamRetries++)))
+    if (streamRetryTimer) clearTimeout(streamRetryTimer)
+    streamRetryTimer = setTimeout(() => { streamRetryTimer = null; connectStream() }, delay)
+  }
+}
+
+// 历史归档（只读）：上下文轮换把旧对话挪进了 archive-*，网页上给一个能看的地方。
+async function openArchives() {
+  const r = await api('/api/archives')
+  const list = (r.ok && r.archives) || []
+  const ov = document.createElement('div')
+  ov.className = 'arch-ov'
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:60;display:flex;align-items:center;justify-content:center;padding:20px'
+  const card = document.createElement('div')
+  card.style.cssText = 'background:var(--panel,#181a20);color:var(--text,#eee);border:1px solid var(--line,#333);border-radius:12px;max-width:680px;width:100%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden'
+  card.innerHTML = '<div style="padding:12px 16px;border-bottom:1px solid var(--line,#333);display:flex;justify-content:space-between;align-items:center">' +
+    '<b>历史对话</b><button class="tool" data-close>关闭</button></div>' +
+    '<div class="arch-list" style="overflow:auto;padding:8px 12px"></div>'
+  const listBox = card.querySelector('.arch-list')
+  const renderList = () => {
+    if (!list.length) { listBox.innerHTML = '<div class="empty">还没有归档的对话</div>'; return }
+    listBox.innerHTML = list.map((a) => {
+      const when = a.at ? (dayLabel(a.at) + ' ' + fmtClock(a.at)) : a.dir
+      return '<button class="tool" data-dir="' + esc(a.dir) + '" style="display:block;width:100%;text-align:left;padding:10px;margin:6px 0">' +
+        esc(when) + ' · ' + (a.count || 0) + ' 条</button>'
+    }).join('')
+  }
+  renderList()
+  card.querySelector('[data-close]').onclick = () => ov.remove()
+  ov.addEventListener('click', (e) => { if (e.target === ov) ov.remove() })
+  listBox.onclick = async (e) => {
+    const b = e.target.closest('[data-dir]')
+    if (!b) return
+    const rr = await api('/api/archive/' + encodeURIComponent(b.dataset.dir))
+    const msgs = (rr.ok && rr.messages) || []
+    listBox.innerHTML = '<div style="padding:6px 0 10px"><button class="tool" data-back>← 返回列表</button></div>'
+    listBox.querySelector('[data-back]').onclick = renderList
+    if (!msgs.length) { listBox.insertAdjacentHTML('beforeend', '<div class="empty">这一页是空的</div>'); return }
+    const wrap = document.createElement('div')
+    for (const m of msgs) {
+      const row = document.createElement('div')
+      row.style.cssText = 'padding:6px 4px;border-bottom:1px dashed rgba(255,255,255,.08);font-size:13px;line-height:1.6;word-break:break-word'
+      const who = m.who === 'user' ? '主人' : bot()
+      const body = m.text || (m.kind === 'image' ? '[图片]' : m.kind === 'voice' ? '[语音]' : m.kind === 'sticker' ? '[表情]' : m.kind === 'file' ? '[文件]' : '')
+      row.innerHTML = '<span style="opacity:.55;margin-right:8px">' + esc(who) + ' ' + esc(fmtClock(m.t)) + '</span>' + esc(body)
+      wrap.appendChild(row)
+    }
+    listBox.appendChild(wrap)
+    listBox.scrollTop = 0
+  }
+  ov.appendChild(card)
+  document.body.appendChild(ov)
 }
 
 async function startPcmRecording(btn) {

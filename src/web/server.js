@@ -178,8 +178,10 @@ export function createWebServer({ dsh, getConfig, setConfig, publicConfig, log, 
     let me = null
     const ticket = url.searchParams.get('ticket')
     if (ticket) {
+      // #12 回归：一次性 ticket 会打死 EventSource 的自动重连（重连 URL 里的票已被消费 → 401 → CLOSED）。
+      // 改成「60 秒内可重复使用」：票本身短命、只在本机接口用，断网/重启/休眠回来都能自愈。
+      pruneTickets()
       const rec = streamTickets.get(ticket)
-      streamTickets.delete(ticket)
       if (rec && Date.now() - rec.at <= 60_000) me = { subject: rec.subject, role: rec.role, level: rec.level }
     } else {
       me = sessionUser(url.searchParams.get('token'))

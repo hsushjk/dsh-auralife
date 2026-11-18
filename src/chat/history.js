@@ -406,14 +406,19 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
 
   // 删客人时的彻底清理：这个 chatId 的全部聊天分片 + 媒体目录一起删。
   // （只有删账号时调用；日常清理走 sweep，不会删整个会话目录。）
+  // 删客人时的彻底清理：这个 chatId 的全部聊天分片 + 媒体目录一起删。
+  // 必须和 append/sweep/archive 用同一把 hist-<chatId> 锁：否则删除期间正有一条消息在写，
+  // 要么 append 撞 ENOENT 静默丢消息，要么删完又凭空建出目录（删不干净）。
   function purgeChat(chatId) {
-    const t = timers.get(chatId)
-    if (t) { clearTimeout(t); timers.delete(chatId) }
-    let removed = 0
-    for (const dir of [chatDir(chatId), mediaDir(chatId)]) {
-      try { rmSync(dir, { recursive: true, force: true }); removed++ } catch {}
-    }
-    return { removed }
+    return withFileLock(lockId(chatId), () => {
+      const t = timers.get(chatId)
+      if (t) { clearTimeout(t); timers.delete(chatId) }
+      let removed = 0
+      for (const dir of [chatDir(chatId), mediaDir(chatId)]) {
+        try { rmSync(dir, { recursive: true, force: true }); removed++ } catch {}
+      }
+      return { removed }
+    }, histLock)
   }
 
   const lockId = (chatId) => `hist-${chatId}`
@@ -542,9 +547,56 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
 
   const archiveChat = (chatId) => withFileLock(lockId(chatId), () => archiveChatLocked(chatId), histLock)
 
+
+  // ---- 历史归档（上下文轮换后的旧对话，只读）----
+  // archiveChat 把旧 seg 原文挪进 chats/<chatId>/archive-<时间戳>/，这里做只读列表/查看。
+  function listArchives(chatId) {
+    let names = []
+    try { names = readdirSync(chatDir(chatId)).filter((n) => /^archive-\d+$/.test(n)) } catch { return [] }
+    names.sort((a, b) => Number(b.replace('archive-', '')) - Number(a.replace('archive-', '')))
+    return names.map((name) => {
+      const dir = join(chatDir(chatId), name)
+      let files = []
+      try { files = readdirSync(dir).filter((f) => f.endsWith('.json') && f !== 'index.json').sort() } catch {}
+      let count = 0
+      let from = 0
+      let to = 0
+      for (const f of files) {
+        const data = readJson(join(dir, f), null)
+        const msgs = data && Array.isArray(data.messages) ? data.messages : []
+        if (!msgs.length) continue
+        count += msgs.length
+        const first = Number(msgs[0].t) || 0
+        const last = Number(msgs[msgs.length - 1].t) || 0
+        if (first && (!from || first < from)) from = first
+        if (last > to) to = last
+      }
+      return { dir: name, at: Number(name.replace('archive-', '')) || 0, count, from, to }
+    })
+  }
+
+  function readArchive(chatId, dirName) {
+    const name = String(dirName || '')
+    if (!/^archive-\d+$/.test(name)) return { ok: false, reason: '没有这个归档' }
+    const dir = join(chatDir(chatId), name)
+    if (!existsSync(dir)) return { ok: false, reason: '没有这个归档' }
+    let files = []
+    try { files = readdirSync(dir).filter((f) => f.endsWith('.json') && f !== 'index.json').sort() } catch {}
+    const messages = []
+    for (const f of files) {
+      const data = readJson(join(dir, f), null)
+      if (data && Array.isArray(data.messages)) messages.push(...data.messages)
+    }
+    messages.sort((a, b) => (Number(a.t) || 0) - (Number(b.t) || 0))
+    const total = messages.length
+    // 只读查看，不续聊：一次最多给 500 条，够看个大概。
+    return { ok: true, dir: name, total, messages: messages.slice(Math.max(0, total - 500)) }
+  }
+
   return {
     append, patchLast, page, pageFile, recent, last, oldestAt, totalOf,
     sweep, sweepAll, touch, finalize, splitCurrent, closeAll, stats, reapOrphanMedia,
     saveMedia, mediaPath: mediaFile, mediaDir, chatDir, archiveChat, purgeChat,
+    listArchives, readArchive,
   }
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, appendFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { readFile, writeFile, readdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
@@ -71,15 +72,35 @@ export function createHub({
     return { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0 }
   })()
   let statsTimer = null
+  // stats.json 是跨进程共享文件：「整份读、整份写」会谁后写谁赢（面板数字回退/丢数）。
+  // 内存里只记「本进程自上次落盘以来的增量」，落盘时进锁读盘、把增量加上去，失败就把增量放回去。
+  const statsPending = {}
+  function flushStats() {
+    const pending = { ...statsPending }
+    const keys = Object.keys(pending)
+    if (!keys.length) return Promise.resolve()
+    for (const k of keys) {
+      if (statsPending[k] === pending[k]) delete statsPending[k]
+      else statsPending[k] -= pending[k]
+    }
+    return withFileLock('stats', async () => {
+      const saved = readJson(statsFile(), () => null)
+      const base = { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0 }
+      if (saved && typeof saved === 'object') for (const k of Object.keys(base)) base[k] = Number(saved[k]) || 0
+      for (const k of keys) base[k] = (Number(base[k]) || 0) + pending[k]
+      await writeJson(statsFile(), base)
+      stats = base
+    }, { staleMs: 10000, timeoutMs: 5000 }).catch((error) => {
+      // 拿不到锁就把增量放回去，下一轮再试，绝不丢数。
+      for (const k of keys) statsPending[k] = (statsPending[k] || 0) + pending[k]
+      log.warn('统计落盘失败：' + (error?.message || error))
+    })
+  }
   function persistStatsSoon() {
     if (statsTimer) return
     statsTimer = setTimeout(() => {
       statsTimer = null
-      try {
-        writeJson(statsFile(), stats)?.catch?.((error) => log.warn('统计落盘失败：' + (error?.message || error)))
-      } catch (error) {
-        log.warn('统计落盘失败：' + (error?.message || error))
-      }
+      flushStats()
     }, 2000)
     statsTimer.unref?.()
   }
@@ -100,7 +121,11 @@ export function createHub({
     }
   }
 
-  const bump = (k) => { stats[k] = (stats[k] || 0) + 1; persistStatsSoon() }
+  const bump = (k) => {
+    stats[k] = (stats[k] || 0) + 1
+    statsPending[k] = (statsPending[k] || 0) + 1
+    persistStatsSoon()
+  }
   const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
 
   // 多进程下每个进程都跑一份插件，sessions.json 的读写要进锁，防互相覆盖丢会话映射。
@@ -192,7 +217,9 @@ export function createHub({
     const day = new Date().toISOString().slice(0, 10)
     const line = JSON.stringify({ t: new Date().toISOString(), chatId, who, text, ...(uid ? { uid } : {}) })
     mkdirSync(chatlogDir(), { recursive: true })
-    appendFileSync(join(chatlogDir(), `${day}.jsonl`), line + '\n')
+    // 和「删客人时的 chatlog 过滤重写」共用一把 lock：否则重写期间新追加的行会被整份覆盖掉。
+    return withFileLock('chatlog', () => appendFileSync(join(chatlogDir(), `${day}.jsonl`), line + '\n'), { staleMs: 10000, timeoutMs: 5000 })
+      .catch((error) => log.warn('对话日志写失败：' + (error?.message || error)))
   }
 
   function chatLogDays() {
@@ -238,6 +265,14 @@ export function createHub({
   // 「一个分片文件 = 一页」的取法，网页端翻历史用
   function pageFileOf(chatId, opts) {
     return history.pageFile(chatId, opts)
+  }
+
+  // 历史归档（只读）：上下文轮换后的旧对话，列表 + 查看，不做续聊。
+  function listArchives(chatId) {
+    try { return history.listArchives(chatId) } catch { return [] }
+  }
+  function readArchive(chatId, dir) {
+    try { return history.readArchive(chatId, dir) } catch (error) { return { ok: false, reason: error?.message || '读不到归档' } }
   }
 
   function historyStats(chatId) {
@@ -977,25 +1012,35 @@ export function createHub({
     const id = String(chatId || '')
     if (!id) return { ok: false, reason: '没有 chatId' }
     await resetChat(id)
-    const h = history.purgeChat(id)
+    // 历史分片/媒体在 hist 锁里删（history.purgeChat 内部已加锁）。
+    const h = await history.purgeChat(id)
     let chatlog = 0
     try {
-      for (const f of readdirSync(chatlogDir()).filter((n) => n.endsWith('.jsonl'))) {
-        const p = join(chatlogDir(), f)
-        let raw = ''
-        try { raw = readFileSync(p, 'utf8') } catch { continue }
-        const out = []
-        for (const line of raw.split('\n')) {
-          const t = line.trim()
-          if (!t) continue
-          let rec = null
-          try { rec = JSON.parse(t) } catch { continue }
-          if (rec && rec.chatId === id) { chatlog++; continue }
-          out.push(t)
+      // chatlog 正常写入也走这把锁；这里用 fs/promises + 临时文件 rename，避免几 MB 日志卡住事件循环。
+      await withFileLock('chatlog', async () => {
+        const dir = chatlogDir()
+        let names = []
+        try { names = (await readdir(dir)).filter((n) => n.endsWith('.jsonl')) } catch { return }
+        for (const f of names) {
+          const p = join(dir, f)
+          let raw = ''
+          try { raw = await readFile(p, 'utf8') } catch { continue }
+          const out = []
+          for (const line of raw.split('\n')) {
+            const t = line.trim()
+            if (!t) continue
+            let rec = null
+            try { rec = JSON.parse(t) } catch { continue }
+            if (rec && rec.chatId === id) { chatlog++; continue }
+            out.push(t)
+          }
+          const tmp = p + '.tmp-' + process.pid
+          try { await writeFile(tmp, out.length ? out.join('\n') + '\n' : '', 'utf8'); await rename(tmp, p) } catch {}
         }
-        try { writeFileSync(p, out.length ? out.join('\n') + '\n' : '') } catch {}
-      }
-    } catch {}
+      }, { staleMs: 10000, timeoutMs: 8000 })
+    } catch (error) {
+      log.warn('清理 chatlog 失败：' + (error?.message || error))
+    }
     return { ok: true, ...(h || {}), chatlog }
   }
 
@@ -1047,6 +1092,8 @@ export function createHub({
     pageOf,
     pageFileOf,
     historyStats,
+    listArchives,
+    readArchive,
     cleanupVoice,
     takePendingReply,
     clearPendingReply,
