@@ -46,6 +46,10 @@ export function createHub({
   const sessionToChat = new Map()
   const turnState = new Map()
   const pending = new Map()
+  // #19：低体力时「看到了先缓几秒再回」。缓的时间挂在 chat 上、消息照常入队，
+  // flush 到点时按队列顺序回——不能用 setTimeout 重新 enqueue（后一句会插到前一句前面），
+  // 也不能丢掉原消息的 wantVoice（语音请求要跟着一起保留）。
+  const replyHoldUntil = new Map() // chatId -> 最早可回复的时间戳
   const typingUntil = new Map()
   const busy = new Set()
   const busyTimers = new Map()
@@ -613,6 +617,7 @@ export function createHub({
 
   async function onUserMessage({ chatId, userId, nickname, text = '', images = [], files = [], voice = null, sticker = '', level = '' }) {
     const cfg = getConfig()
+    const wantVoice = Boolean(voice && voice.data)
     typingUntil.delete(chatId)
     let userSticker = null
     const chat = { chatId, userId, nickname: nickname || userId, ...(level ? { level } : {}) }
@@ -726,24 +731,17 @@ export function createHub({
       log.warn('睡眠门禁出错：' + (error?.message || error))
     }
     // #19（按用户要求改）：体力低时不是「记账以后再补」，而是「看到了，先隔 3~5 秒再回」。
-    // 延迟期间她仍是醒着的、消息也还在队列里；不再用 pending-reply（单槽且会被下一句清掉，
-    // 被吞的那句就永远补不回来了）。
+    // 不再用 pending-reply（单槽且会被下一句清掉），也不 setTimeout 重新 enqueue——
+    // 只给这个 chat 挂一个「最早回复时间」，消息照常入队；后续消息排在它后面，
+    // 保证先来的先回，语音请求的 wantVoice 也原样带下去。
     if (chatId === OWNER_ID && !pendingReply && content.length > 0) {
       try {
         const chance = Number(energyOf?.()?.gate?.()?.readIgnoreChance) || 0
         if (chance > 0 && Math.random() < chance) {
           bump('read_no_reply')
           const delay = 3000 + Math.floor(Math.random() * 2000)
+          replyHoldUntil.set(chatId, Date.now() + delay)
           log.info(`这条先缓一缓（体力低），${Math.round(delay / 1000)} 秒后再回`)
-          const timer = setTimeout(() => {
-            try {
-              if (getConfig().enabled) enqueue(chat, content, userId, false)
-            } catch (error) {
-              log.warn('延迟回复失败：' + (error?.message || error))
-            }
-          }, delay)
-          timer.unref?.()
-          return
         }
       } catch (error) {
         log.warn('已读不回判定出错：' + (error?.message || error))
@@ -753,7 +751,7 @@ export function createHub({
     if (chatId === OWNER_ID) persistPendingReply(null)
     if (!cfg.enabled) return
     if (content.length === 0) return
-    enqueue(chat, content, userId, false)
+    enqueue(chat, content, userId, wantVoice)
   }
 
   // 给 drive 用：取一条「该补一句」的未回消息（默认 5 分钟前、1 小时内，只补主人的）。
@@ -860,6 +858,10 @@ export function createHub({
     const firstSender = [...p.senders][0] || ''
     markBusy(chatId)
     try {
+      // #19：低体力时先把这条消息在队列里按顺序等 3~5 秒再回（不重新排队，不打乱先后）。
+      const hold = Math.max(0, (Number(replyHoldUntil.get(chatId)) || 0) - Date.now())
+      replyHoldUntil.delete(chatId)
+      if (hold > 0) await new Promise((resolve) => { const t = setTimeout(resolve, hold); t.unref?.() })
       // 体力低的时候连回复都变慢（#21）：不是装饰，能感觉到她累了。
       const delay = Number(energyOf()?.gate?.()?.replyDelayMs) || 0
       if (delay > 0) await new Promise((resolve) => { const t = setTimeout(resolve, delay); t.unref?.() })

@@ -199,15 +199,16 @@ export function changePassword(subject, oldPassword, newPassword) {
   return { ok: true }
 }
 
-export function deleteGuest(subject) {
+export async function deleteGuest(subject) {
   const u = loadUsers()
   if (!u.guests[subject]) return { ok: false, reason: '没有这个客人' }
   delete u.guests[subject]
   saveUsers(u)
 
-  const s = loadSessions()
-  for (const [k, v] of Object.entries(s)) if (v.subject === subject) delete s[k]
-  saveSessions(s)
+  // #8：删会话也是整份写，必须进锁，否则会盖掉别的进程刚登录/登出的会话。
+  await updateSessions((s) => {
+    for (const [k, v] of Object.entries(s)) if (v.subject === subject) delete s[k]
+  })
   return { ok: true }
 }
 

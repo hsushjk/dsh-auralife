@@ -157,6 +157,6 @@ export function register(router, ctx) {
   router.prefix('DELETE', 'api/guests/', async (req, res, url, p) => {
     const me = requireOwner(req, res); if (!me) return
     const subject = decodeURIComponent(p.slice('api/guests/'.length))
-    return json(res, deleteGuest(subject))
+    return json(res, await deleteGuest(subject))
   })
 }
