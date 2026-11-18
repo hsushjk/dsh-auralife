@@ -196,9 +196,9 @@ export async function updateGuest(subject, { displayName, note, username, passwo
     try {
       await syncSessionLevels(subject, out.level)
     } catch (error) {
-      // 资料/权限已经存进 users.json 了，但已登录会话还是旧档位：如实告诉面板，
-      // 让它提示「请再点一次重试」，而不是显示成功让人以为生效了。
-      return { ok: false, reason: '权限已保存，但已登录的会话没同步（别的进程正在写会话）：' + (error?.message || error) + '；请再点一次重试' }
+      // 资料/权限已经存进 users.json 了，但已登录会话还是旧档位：接口语义是「已保存 + 有警告」，
+      // 不能报 ok:false（面板会以为没生效）；warning 让前端提示「请再点一次同步」。
+      return { ok: true, level: out.level, warning: '权限已保存，但已登录的会话没同步（别的进程正在写会话）：' + (error?.message || error) + '；请再点一次同步' }
     }
   }
   const { level: _ignored, ...rest } = out

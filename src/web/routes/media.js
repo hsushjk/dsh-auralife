@@ -160,12 +160,12 @@ export function register(router, ctx) {
     if (!data) {
       try { unlinkSync(dataDir('background')) } catch {}
       try { unlinkSync(dataDir('background.mime')) } catch {}
-      setConfig({ theme: { mode: getConfig().theme.mode, background: '' } })
+      await setConfig({ theme: { mode: getConfig().theme.mode, background: '' } })
       return json(res, { ok: true })
     }
     writeFileSync(dataDir('background'), Buffer.from(data, 'base64'))
     writeFileSync(dataDir('background.mime'), b.mime || 'image/jpeg')
-    setConfig({ theme: { mode: getConfig().theme.mode, background: 'local' } })
+    await setConfig({ theme: { mode: getConfig().theme.mode, background: 'local' } })
     return json(res, { ok: true })
   })
 }

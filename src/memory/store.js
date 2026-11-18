@@ -314,9 +314,12 @@ export function createMemStore({ log = console } = {}) {
 
   // 按 chatId 清理一个会话的全部记忆（删客人时用）：重写分片、丢掉该会话的事实/事件
   // 以及连着这些事实的联想边。返回各 kind 删掉的条数。
+  // A1：整份重写月度分片必须和 append/patch 共用 mem-facts 锁；
+  // 写盘失败直接抛给调用方（别再 try{}catch{} 静默），否则删客人时记忆静默残留。
   function purgeChat(chatId) {
     const id = String(chatId || '')
-    if (!id) return { facts: 0, episodes: 0, edges: 0 }
+    if (!id) return Promise.resolve({ facts: 0, episodes: 0, edges: 0 })
+    return lockAndRun('mem-facts', () => {
     const removed = new Set()
     const filterKind = (kind, keepFn) => {
       const dir = dirOf(kind)
@@ -339,7 +342,7 @@ export function createMemStore({ log = console } = {}) {
             if (kind === 'facts' && rec.id) removed.add(rec.id)
           }
         }
-        if (dropped) { try { writeFileSync(p, keep.length ? keep.join('\n') + '\n' : '') } catch {} }
+        if (dropped) writeFileSync(p, keep.length ? keep.join('\n') + '\n' : '')
       }
       return dropped
     }
@@ -348,6 +351,7 @@ export function createMemStore({ log = console } = {}) {
     const edges = filterKind('edges', (r) => !removed.has(r.a) && !removed.has(r.b))
     invalidate()
     return { facts, episodes: eps, edges }
+    }, { staleMs: 10000, timeoutMs: 15000 })
   }
 
   // 破坏性清空（仅 debug 用，见 web/routes/debug.js）：删掉该 kind 的全部 jsonl。

@@ -21,7 +21,12 @@ export function register(router, ctx) {
       const hit = ctx.listPersonas().find((x) => x.id === pid)
       if (hit?.name) b.botName = hit.name
     }
-    setConfig(b)
+    try {
+      await setConfig(b)
+    } catch (error) {
+      log.warn('配置保存失败：' + (error?.message || error))
+      return json(res, { ok: false, reason: '配置写盘失败：' + (error?.message || error), config: publicConfig(getConfig()) })
+    }
     try { deps?.rebindPort?.() } catch {}
     return json(res, { ok: true, config: publicConfig(getConfig()) })
   })

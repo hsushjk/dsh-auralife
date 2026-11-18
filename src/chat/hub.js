@@ -58,6 +58,7 @@ export function createHub({
   const waiting = new Set()
   const usageCache = new Map() // chatId -> { t, tokens, window, ratio }
   const usageReal = new Map() // chatId -> { t, used }（平台 assistant/message.usage 报的真实 token）
+  let usageWarned = false
   const rotatedChats = new Map() // chatId -> { at, n }（本进程内：该 chat 已经归档转生过的次数）
   let liveWindow = 0 // DSH 平台真实窗口：session/event 里 request/context 事件带 contextWindow（如 1M）
   let liveModel = ''
@@ -114,13 +115,18 @@ export function createHub({
   // 现在落盘到 data/pending-reply.json，跨进程读；认领时用锁 + claimedAt 防两个进程各补一遍。
   let pendingReply = null
   const pendingFile = () => dataDir('pending-reply.json')
+  // A2：写盘必须进 pending-reply 锁（和 takePendingReply 的认领写共用一把锁），
+  // 否则两进程各自整份写，claimedAt 会被覆盖成 null → 同一条漏补/重复补。
+  // 写盘排队串行；认领前先等这条链，保证本进程「刚记下」的消息不会读到旧盘。
+  let pendingWriteChain = Promise.resolve()
   function persistPendingReply(p) {
     pendingReply = p || null
-    try {
-      writeJson(pendingFile(), p || null)?.catch?.((error) => log.warn('未回消息落盘失败：' + (error?.message || error)))
-    } catch (error) {
-      log.warn('未回消息落盘失败：' + (error?.message || error))
-    }
+    const value = p || null
+    pendingWriteChain = pendingWriteChain
+      .catch(() => {})
+      .then(() => lockAndRun('pending-reply', () => { writeJson(pendingFile(), value) }, { staleMs: 15000, timeoutMs: 5000 }))
+      .catch((error) => { log.warn('未回消息落盘失败：' + (error?.message || error)) })
+    return pendingWriteChain
   }
 
   const bump = (k) => {
@@ -523,7 +529,7 @@ export function createHub({
     if (!item) { log.debug('表情库是空的，跳过表情'); return false }
 
     await appendMessage(chatId, { who: 'bot', text: '[表情]', kind: 'sticker', sticker: item.md5, name: item.name || '', caption: item.name || '', mark: 'sticker' })
-    stickers.markUsed?.(item.md5)
+    try { await stickers.markUsed?.(item.md5) } catch (error) { log.warn('表情使用计数落盘失败：' + (error?.message || error)) }
     bump('stickers')
     return true
   }
@@ -615,8 +621,22 @@ export function createHub({
     return message.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim()
   }
 
-  function startTyping(chatId) { emit?.('typing', { chatId, on: true }) }
-  function stopTyping(chatId) { emit?.('typing', { chatId, on: false }) }
+  // B7：正常轮次靠 turn/end 收 typing；万一 turn/end 丢了，不能让它永远转圈。
+  const TYPING_MAX_MS = 10 * 60_000
+  const typingTimers = new Map()
+  function startTyping(chatId) {
+    emit?.('typing', { chatId, on: true })
+    const old = typingTimers.get(chatId)
+    if (old) clearTimeout(old)
+    const t = setTimeout(() => { log.warn(`${chatId}：typing 超过 ${TYPING_MAX_MS / 60000} 分钟，自动收起`); stopTyping(chatId) }, TYPING_MAX_MS)
+    t.unref?.() // 不阻塞退出：这只是兜底清理，不是调用方在等的东西
+    typingTimers.set(chatId, t)
+  }
+  function stopTyping(chatId) {
+    const t = typingTimers.get(chatId)
+    if (t) { clearTimeout(t); typingTimers.delete(chatId) }
+    emit?.('typing', { chatId, on: false })
+  }
 
   function onSessionEvent(session, event) {
     const key = sessionKey(session && session.id)
@@ -629,8 +649,17 @@ export function createHub({
       if (d.interrupted) return
       // C：平台自带本步真实 usage（inputTokens 含上下文），轮换判断用它，别再按字节数估。
       if (d.usage) {
-        const used = Number(d.usage.totalTokens) || ((Number(d.usage.inputTokens) || 0) + (Number(d.usage.outputTokens) || 0))
-        if (Number.isFinite(used) && used > 0) usageReal.set(chatId, { t: Date.now(), used })
+        // C13：平台字段名没有写进本地 DSH 类型声明，按常见几种形态兜底；
+        // 认不出来时只 warn 一次，别静默永远退回估算。
+        const us = d.usage
+        const cand = [
+          Number(us.totalTokens), Number(us.total),
+          (Number(us.inputTokens) || 0) + (Number(us.outputTokens) || 0),
+          (Number(us.promptTokens) || 0) + (Number(us.completionTokens) || 0),
+        ]
+        const used = cand.find((n) => Number.isFinite(n) && n > 0) || 0
+        if (used > 0) usageReal.set(chatId, { t: Date.now(), used })
+        else if (!usageWarned) { usageWarned = true; log.warn('assistant/message.usage 字段无法识别：' + Object.keys(us).join(',')) }
       }
       const t = textOf(d.message)
       if (t) { st.lastTurn = d.turn; st.text = t }
@@ -816,24 +845,26 @@ export function createHub({
       return p
     }
     try {
+      // 先等本进程挂起的落盘写完，避免读到旧盘（A2）。
+      try { await pendingWriteChain } catch {}
       return await lockAndRun('pending-reply', () => {
         const disk = readJson(pendingFile(), () => null)
         const p = usable(disk) || usable(pendingReply)
         if (!p) {
-          if (disk || pendingReply) persistPendingReply(null)
+          if (disk || pendingReply) writeJson(pendingFile(), null)
+          pendingReply = null
           return null
         }
         // 别的进程刚认领过 → 让位等它补（5 分钟 TTL，超时说明它没补成，允许重试）。
         if (p.claimedAt && now - Number(p.claimedAt) < 5 * 60_000) return null
         if (maxAgeMs > 0 && now - (Number(p.at) || 0) > maxAgeMs) {
-          persistPendingReply(null)
+          writeJson(pendingFile(), null)
+          pendingReply = null
           return null
         }
         pendingReply = null
         const claimed = { ...p, claimedAt: now }
-        try {
-          writeJson(pendingFile(), claimed)?.catch?.((error) => log.warn('未回消息认领落盘失败：' + (error?.message || error)))
-        } catch {}
+        writeJson(pendingFile(), claimed) // 写失败会抛出，交给外层 catch（锁内不吞错）
         return claimed
       }, { staleMs: 15000, timeoutMs: 5000 })
     } catch (error) {
@@ -912,10 +943,11 @@ export function createHub({
       // #19：低体力时先把这条消息在队列里按顺序等 3~5 秒再回（不重新排队，不打乱先后）。
       const hold = Math.max(0, (Number(replyHoldUntil.get(chatId)) || 0) - Date.now())
       replyHoldUntil.delete(chatId)
-      if (hold > 0) await new Promise((resolve) => { const t = setTimeout(resolve, hold); t.unref?.() })
+      // B6：这里在 await，unref 会让事件循环在「只剩等它」时空掉；不能 unref。
+      if (hold > 0) await new Promise((resolve) => { setTimeout(resolve, hold) })
       // 体力低的时候连回复都变慢（#21）：不是装饰，能感觉到她累了。
       const delay = Number(energyOf()?.gate?.()?.replyDelayMs) || 0
-      if (delay > 0) await new Promise((resolve) => { const t = setTimeout(resolve, delay); t.unref?.() })
+      if (delay > 0) await new Promise((resolve) => { setTimeout(resolve, delay) })
       await pushToSession(p.chat, content, firstSender, { wantVoice: p.wantVoice, extraSenders: [...p.senders] })
     } catch (e) {
       bump('errors')
@@ -925,6 +957,7 @@ export function createHub({
   }
 
   function release(chatId) {
+    stopTyping(chatId) // B7：超时强制放开时也别让「正在输入」挂着
     busy.delete(chatId)
     const t = busyTimers.get(chatId)
     if (t) { clearTimeout(t); busyTimers.delete(chatId) }

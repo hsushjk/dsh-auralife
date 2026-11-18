@@ -60,7 +60,9 @@ export function apply(ctx) {
   const setConfig = (patch) => {
     cfg = mergeFromPanel(cfg, patch) // 本进程立即生效
     maxLogMB = Number(cfg.logs?.maxMB) || 2
-    configSaveChain = configSaveChain
+    // A3：上次失败不阻塞这次，但这次的失败要抛给调用方——面板不能永远显示「保存成功」。
+    const task = configSaveChain
+      .catch(() => {})
       .then(() => lockAndRun('config', () => {
         const disk = loadConfig()
         const merged = mergeFromPanel(disk, patch)
@@ -70,9 +72,10 @@ export function apply(ctx) {
       .then((merged) => {
         cfg = merged
         maxLogMB = Number(cfg.logs?.maxMB) || 2
+        return merged
       })
-      .catch((error) => { log.warn('配置保存失败：' + (error?.message || error)) })
-    return configSaveChain
+    configSaveChain = task.catch(() => {})
+    return task
   }
   seedPersonas()
 
