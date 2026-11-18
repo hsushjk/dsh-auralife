@@ -21,15 +21,16 @@ const ROTATE_FIXED_TOKENS = 2000 // 平台固定开销估算（系统提示+工�
 const MODEL_WINDOW_FALLBACK = { 'deepseek-chat': 64000, 'deepseek-reasoner': 64000, 'deepseek-flash': 128000, 'deepseek-v3': 128000 }
 const DEFAULT_WINDOW = 64000
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 const sessionKey = (id) => String(id || '').replace(/^session-/, '')
 
 export function createHub({
   dsh, getConfig, log, stickers, tts, buildTools, contextProviders, dynamicContext,
-  onActivity, isMuted, moodEffects, emit, getModelPreference, sleep, energy,
+  onActivity, isMuted, moodEffects, emit, getModelPreference, sleepStage, energy,
 }) {
-  // sleep/energy 在 host 里创建顺序靠后：用 getter 延迟取，避免循环依赖。
-  const sleepOf = () => (typeof sleep === 'function' ? sleep() : sleep)
+  // sleepStage/energy 在 host 里创建顺序靠后：用 getter 延迟取，避免循环依赖。
+  // 注意：注入的是「睡眠器官」的 getter，名字不能叫 sleep——会遮蔽模块级的 delay 语义（B）。
+  const sleepOf = () => (typeof sleepStage === 'function' ? sleepStage() : sleepStage)
   const energyOf = () => (typeof energy === 'function' ? energy() : energy)
   const chatlogDir = () => dataDir('chatlog')
   const sessionsFile = () => dataDir('sessions.json')
@@ -581,7 +582,13 @@ export function createHub({
       else if (it.kind === 'sticker') await sendSticker(chatId, it.value)
       else if (it.kind === 'image') await sendImage(chatId, it.value)
       else if (it.kind === 'file') await sendFile(chatId, it.value, it.name)
-      if (i < items.length - 1) await sleep(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
+      if (i < items.length - 1) {
+        // B：这里必须是延时函数，不是睡眠器官 getter。顺手记实际间隔，出问题能当场看到。
+        const gap = bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay
+        const startedAt = Date.now()
+        await delay(gap)
+        log.debug?.(`${chatId}：气泡间隔 ${Math.round(gap)}ms（实际 ${Date.now() - startedAt}ms）`)
+      }
     }
     logChat(chatId, 'bot', items.map((i) => (i.kind === 'text' || i.kind === 'voice' || i.kind === 'file' ? i.value : `[${i.kind}]`)).join(' '))
     lastChatAt = Date.now()

@@ -201,7 +201,7 @@ export function apply(ctx) {
     stickers,
     tts,
     // 睡眠是硬状态：hub 里判「睡着时被找」要用（#25），getter 延迟取避免循环依赖。
-    sleep: () => sleep,
+    sleepStage: () => sleep,
     energy: () => energy,
     // #7：身体状态（体力/激素/睡眠）不进会话级缓存的能力清单，每轮说话时现取现拼，
     // 避免 DSH 侧把 systemPrompt.context 的 text() 按会话缓存后一直用旧快照。
