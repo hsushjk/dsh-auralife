@@ -18,6 +18,7 @@ import { createSelf } from './life/self.js'
 import { createChemistry } from './life/chemistry.js'
 import { createEnergy } from './life/energy.js'
 import { createAlarm } from './life/alarm.js'
+import { createSleep } from './life/sleep.js'
 import { findGapSentence } from './life/gap.js'
 import { createOrganHost } from './organs/organ-host.js'
 import { createBootstrap, capabilityGapText } from './organs/organ-bootstrap.js'
@@ -52,15 +53,26 @@ export function apply(ctx) {
   // 开关已收窄只有 TTS/STT/生图/提示音四个需要开关，其余模块恒开。
   // 四个开关热生效——每次使用都现读 config。
   // 配置落盘串行队列：内存 cfg 立即生效（热生效语义不变），磁盘写入排队执行。
-  // 多进程下 config.json 读-改-写必须进锁，但锁现在是异步的，不能阻塞调用方。
+  // 多进程下 config.json 读-改-写必须进锁；更重要的是**不能在锁内拿本进程启动时的旧快照整份覆盖**——
+  // 锁只防并发，防不了「A 进程拿着 10 分钟前的内存 cfg、把 B 进程刚保存的设置整份盖回去」。
+  // 正确做法：锁内重新读盘 → 把本次 patch 合并到最新磁盘内容 → 落盘 → 用落盘结果回写内存。
   let configSaveChain = Promise.resolve()
   const setConfig = (patch) => {
-    const next = mergeFromPanel(cfg, patch)
-    cfg = next
+    cfg = mergeFromPanel(cfg, patch) // 本进程立即生效
     maxLogMB = Number(cfg.logs?.maxMB) || 2
     configSaveChain = configSaveChain
-      .then(() => withFileLock('config', () => saveConfig(next), { staleMs: 5000, timeoutMs: 4000 }))
+      .then(() => withFileLock('config', () => {
+        const disk = loadConfig()
+        const merged = mergeFromPanel(disk, patch)
+        saveConfig(merged)
+        return merged
+      }, { staleMs: 5000, timeoutMs: 8000 }))
+      .then((merged) => {
+        cfg = merged
+        maxLogMB = Number(cfg.logs?.maxMB) || 2
+      })
       .catch((error) => { log.warn('配置保存失败：' + (error?.message || error)) })
+    return configSaveChain
   }
   seedPersonas()
 
@@ -180,6 +192,7 @@ export function apply(ctx) {
   let memory = null
   let azone = null
   let drive = null
+  let sleep = null
 
   const hub = createHub({
     dsh: ctx,
@@ -187,11 +200,19 @@ export function apply(ctx) {
     log: logger.child('chat'),
     stickers,
     tts,
+    // 睡眠是硬状态：hub 里判「睡着时被找」要用（#25），getter 延迟取避免循环依赖。
+    sleep: () => sleep,
+    energy: () => energy,
+    // #7：身体状态（体力/激素/睡眠）不进会话级缓存的能力清单，每轮说话时现取现拼，
+    // 避免 DSH 侧把 systemPrompt.context 的 text() 按会话缓存后一直用旧快照。
+    dynamicContext: () => {
+      try { return [energy.contextLine(), chemistry.contextLine?.(), sleep?.contextLine?.()].filter(Boolean).join('\n') } catch { return '' }
+    },
     buildTools: (where) => {
       // 内置工具 + 她自己长出来的器官注册的工具（器官闭环：能力不只出现在清单，还能真被调用）。
       const base = buildTools({ hub, getConfig, setConfig, stickers, azone, memory, imageGen, drive, wishes, life, self, chemistry, alarm, listModels, organHost, saveAvatar: (b64, mime) => { writeFileSync(dataDir('avatar'), Buffer.from(b64, 'base64')); writeFileSync(dataDir('avatar.mime'), String(mime || 'image/png')) } }, where)
-      // 器官工具是她的私房能力：只挂到主人会话（level==='full'），客人/系统会话拿不到。
-      if (where.level === 'full') {
+      // #4：器官是她的私房能力，只挂给主人本人；客人即使被开了 full 也拿不到（改人格/写记忆的桶只对主人开）。
+      if (where.level === 'full' && where.chat?.userId === OWNER_ID) {
         for (const def of organHost.toolDefs()) {
           try { base.push(defineTool(def)) } catch (error) { log.warn('器官工具注册出错：' + error.message) }
         }
@@ -199,7 +220,8 @@ export function apply(ctx) {
       return base
     },
     contextProviders: [
-      ({ chat }) => (chat.system ? '' : organHost.contextLine()),
+      // 能力清单是静态的，可以随会话缓存；身体状态改走 dynamicContext 每轮注入（#7）。
+      ({ chat }) => (chat.system ? '' : (organHost.capabilityLine?.() || '')),
       ({ chat, sessionId }) => (chat.system ? '' : memory.contextFor(chat, sessionId)),
     ],
     onActivity: (a) => {
@@ -215,6 +237,9 @@ export function apply(ctx) {
         } catch (error) {}
       }
       if (a.kind === 'in') life.touch('interaction').catch(() => {})
+      // #37：主人消息要把「上次被看见」落盘，其它模块（azone 日记/冷落检测）靠它跨进程、跨重启判断。
+      // #4：只认主人本人，跟 level 无关——客人被开了 full 也不算「主人看见」。
+      if (a.kind === 'in' && a.userId === OWNER_ID) life.touch('seen').catch(() => {})
 
       // 主人一说话，「被冷落」窗口就打破（她主动搭话有人理了）。
       if (a.kind === 'in') { try { drive.clearSpoke() } catch {} }
@@ -226,18 +251,33 @@ export function apply(ctx) {
         // 不再存心情数值（mood 已删）。±5 死区：轻微波动不算身体应激，避免每轮打分把皮质醇顶到 100。
         judgeChem({ dsh: ctx, getConfig, life, userText: a.userText, reply: a.reply, who: a.userId === OWNER_ID ? ownerName : '对方', origin: speakUp ? 'speak-up' : 'user' })
           .then((r) => {
-            if (r && Math.abs(r.delta) >= 5) {
-              if (r.delta < 0) chemistry.event({ cortisol: Math.min(6, -r.delta / 2), serotonin: -1 }, '这轮聊得不好').catch(() => {})
-              else chemistry.event({ dopamine: Math.min(5, r.delta / 2), serotonin: 1 }, '这轮聊得开心').catch(() => {})
+            // #35：confidence 终于被读了——规则命中是 0.6，模型自己没把握（<0.4）的结果不采信。
+            if (!r || Math.abs(r.delta) < 5) return
+            if (r.confidence != null && r.confidence < 0.4) return
+            if (r.delta < 0) chemistry.event({ cortisol: Math.min(6, -r.delta / 2), serotonin: -1 }, '这轮聊得不好').catch(() => {})
+            else chemistry.event({ dopamine: Math.min(5, r.delta / 2), serotonin: 1 }, '这轮聊得开心').catch(() => {})
+            // #38：情绪够重的一轮留个「有感而发」的由头，下次日记触发时能带着它写。
+            if (Math.abs(r.delta) >= 8) {
+              try { azone?.noteEvent?.(`刚才那轮${r.delta > 0 ? '聊得很开心' : '聊得有点难受'}：${String(r.reason || '').slice(0, 80)}`) } catch (error) {}
+              // #13：聊得重的一轮，也让她想一想「这段关系里我是什么样的人」。
+              if (a.userId === OWNER_ID) { try { maybeReflectSelf('聊得重') } catch (error) {} }
             }
           })
           .catch(() => {})
+        // #6/#13：主人聊了几轮，让她有机会从最近这段对话里长一点自我认知（内部 6 小时节流）。
+        if (a.userId === OWNER_ID) { try { maybeReflectSelf('主人这一轮') } catch (error) {} }
         // P5：从她的话里自动长出执念（只收「明确表示未知/查不到」且「不是讲道理」的句子）。
+        // #34：缺口收割要有来源判断——只认主人会话里她自己说的话；客人把话带偏后种下的执念会烧她的自驱。
+        // chatId 记来源，wishes.add 内部按归一化文本判重（不再只跟 open 完全同字比）。
         try {
-          const gap = findGapSentence(a.reply)
-          if (gap && !wishes.list().some((w) => w.status === 'open' && w.text === gap)) {
-            wishes.add(gap, { baseTension: 80, tensionRate: 5 }).catch(() => {})
-            log.info('长出执念：「' + gap + '」')
+          const ownerTurn = a.userId === OWNER_ID
+          if (ownerTurn) {
+            const gap = findGapSentence(a.reply)
+            if (gap) {
+              wishes.add(gap, { baseTension: 80, tensionRate: 5, chatId: a.chatId })
+                .then((w) => { if (w) log.info('长出执念：「' + gap + '」') })
+                .catch((error) => log.warn('种执念失败：' + (error?.message || error)))
+            }
           }
         } catch (error) {}
         // S1 器官自举：Ta 明确说「我做不了 X」/「我给自己捏了个 X」→ 生成器官，落盘立即生效。
@@ -245,7 +285,7 @@ export function apply(ctx) {
         // 客人会话命中缺口只记审计、不自举（不改变对客人的回复，只是不落盘器官）。
         try {
           const capGap = capabilityGapText(a.reply)
-          const ownerTurn = a.level === 'full' || a.userId === OWNER_ID
+          const ownerTurn = a.userId === OWNER_ID
           if (capGap && !bootstrappedGaps.has(capGap)) {
             if (!ownerTurn) {
               organHost.audit.append({ event: 'bootstrap_skip', reason: 'guest-chat', chatId: a.chatId, userId: a.userId || '', gap: capGap.slice(0, 120) })
@@ -278,7 +318,53 @@ export function apply(ctx) {
     onDiary: (text) => memory.extractDiary(text),
   })
   const azoneSocial = createAzoneSocial({ getConfig, hub, log: logger.child('azone'), memory, azone, botName: () => life.load().identity?.name || cfg.botName || 'AuraLife', emit: (type, payload) => web.emit(type, payload) })
-  drive = createDrive({ getConfig, hub, log: logger.child('drive'), life, wishes, memory, chemistry, dsh: ctx, isMuted: () => false, emit: (type, payload) => web.emit(type, payload) })
+  drive = createDrive({ getConfig, hub, log: logger.child('drive'), life, wishes, memory, chemistry, self: () => self, alarm: () => alarm, dsh: ctx, isMuted: () => false, emit: (type, payload) => web.emit(type, payload), sleep: () => sleep, energy: () => energy })
+
+  // #6/#13：自我不只靠记忆重放长——聊得深/情绪重的时候，她也会想一想「我是什么样的人」。
+  // 节流：6 小时内最多反省一次，且同时只跑一个（模型调用不能把聊天卡住）。
+  let selfReflectAt = 0
+  let selfReflecting = false
+  async function maybeReflectSelf(reason) {
+    if (selfReflecting) return
+    if (Date.now() - selfReflectAt < 6 * 3600_000) return
+    // #13a：先把时间记上——模型回「没有新东西」或反省失败也算跑过一次，
+    // 不然之后每轮主人消息都会白烧一次模型。跨进程用 state.self.lastReflectAt 兜底。
+    selfReflecting = true
+    selfReflectAt = Date.now()
+    try {
+      const s0 = life.load()
+      if (Date.now() - (Number(s0.self?.lastReflectAt) || 0) < 6 * 3600_000) return
+      const recent = hub.recentChat(OWNER_ID, 8)
+      if (!recent || recent.length < 3) return
+      // 先占住跨进程节流位，再调模型（模型挂住也不会让别的进程再来一次）。
+      await life.update((s) => { s.self = { ...(s.self || {}), lastReflectAt: Date.now() } })
+      const r = await self.consider({ recent, chemistry: chemistry.peek(), now: Date.now() })
+      if (r && r.merged) {
+        log.info(`自我认知更新（${reason}）：${String(JSON.stringify(r.extracted)).slice(0, 160)}`)
+      }
+    } catch (error) {
+      log.warn('自我反省失败：' + (error?.message || error))
+    } finally {
+      selfReflecting = false
+    }
+  }
+
+  // 睡眠/梦（#18 #24 #25）：硬状态进 state.json（跨进程可见），梦在睡眠 1/3、2/3 处各做一次。
+  sleep = createSleep({
+    life,
+    energy,
+    chemistry,
+    dsh: ctx,
+    getConfig,
+    log: logger.child('sleep'),
+    memory: () => memory,
+    drive: () => drive,
+    notify: async (text) => {
+      const owner = life.load().identity?.ownerName || cfg.ownerName || '主人'
+      await hub.pushToSession({ chatId: OWNER_ID, userId: OWNER_ID, nickname: owner }, [{ type: 'text', text }], '')
+    },
+    writeDiary: async (opts) => { try { await azone?.writeDiary?.(opts || {}) } catch (error) {} },
+  })
 
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
@@ -324,12 +410,22 @@ export function apply(ctx) {
 
   const whenReady = (fn) => () => { if (!cfg.setupDone) return; return fn() }
   ctx.effect(() => ctx.interval(safe(whenReady(() => azone.tick()), '空间日记'), 60_000), 'auralife: 空间日记')
+  // 睡眠/梦：进/出静默期、drowsy 回睡、睡眠 1/3、2/3 处做梦。
+  ctx.effect(() => ctx.interval(safe(whenReady(() => sleep.tick()), '睡眠/梦'), 60_000), 'auralife: 睡眠/梦')
   ctx.effect(() => ctx.interval(safe(whenReady(() => drive.tick()), '自驱'), 60_000), 'auralife: 自驱')
   ctx.effect(() => ctx.interval(safe(whenReady(async () => {
-    // 跨天自我唤醒：扫她自己设的闹钟，到点逐个 fire（主动搭话），响完标记 fired。
+    // 跨天自我唤醒：扫她自己设的闹钟，到点逐个 fire（主动搭话）。
+    // 两段式（#31）：认领 → 发成功才 markFired；发失败 failFired 退避重试（最多 2 次），不再永久丢提醒。
     const due = await alarm.fireDue()
     for (const a of due) {
-      try { await drive.fireAlarm(a) } catch (e) { log.warn('闹钟唤醒出错：', e.message) }
+      try {
+        const sent = await drive.fireAlarm(a)
+        if (sent) await alarm.markFired(a.id)
+        else await alarm.failFired(a.id, '没发出去')
+      } catch (e) {
+        log.warn('闹钟唤醒出错：', e.message)
+        await alarm.failFired(a.id, e.message).catch(() => {})
+      }
     }
   }), '闹钟'), 60_000), 'auralife: 闹钟')
   // 器官磁盘同步：DSH 多进程下，bootstrap 落盘/卸载发生在别的进程时，本进程每分钟重扫一次磁盘，
@@ -345,7 +441,9 @@ export function apply(ctx) {
     try {
       const d = drive.state()
       if (d.lastSpokeAt && !d.coldMarked && Date.now() - d.lastSpokeAt >= 30 * 60_000) {
-        if (hub.lastOwnerChatAt < d.lastSpokeAt) {
+        // #37：主人最后说话时间不能只看进程内存（重启归零会误判「没人理」）；用落盘的 life.lastSeenAt 兜底。
+        const lastOwner = Math.max(Number(hub.lastOwnerChatAt) || 0, Number(life.load()?.life?.lastSeenAt) || 0)
+        if (lastOwner < d.lastSpokeAt) {
           chemistry.event({ cortisol: 4, serotonin: -4, dopamine: -2 }, '主动搭话没人理').catch(() => {})
           drive.markCold()
         }
@@ -364,12 +462,12 @@ export function apply(ctx) {
     return { dshVersion, node: process.version, platform: process.platform, arch: process.arch }
   }
 
-  web.register(ctx, { hub, azone, stickers, memory, drive, imageGen, listModels, azoneSocial, logger, asrInfo: tts.asrInfo, rebindPort: () => web.listenPort(), self, life, wishes, organHost, chemistry, energy, alarm, hostInfo })
+  web.register(ctx, { hub, azone, stickers, memory, drive, imageGen, listModels, azoneSocial, logger, asrInfo: tts.asrInfo, rebindPort: () => web.listenPort(), self, life, wishes, organHost, chemistry, energy, alarm, sleep, hostInfo })
 
   ctx.effect(() => {
     web.listenPort()
     return () => { try { web.closePort() } catch (error) {} }
   }, 'auralife: 固定入口')
 
-  return { hub, stickers, azone, memory, getConfig, setConfig, logger }
+  return { hub, stickers, azone, memory, drive, sleep, getConfig, setConfig, logger }
 }

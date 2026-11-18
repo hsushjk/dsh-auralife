@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
-import { dataDir, readJson, writeJson } from '../core/store.js'
+import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
 
 const usersFile = () => dataDir('users.json')
 const sessionsFile = () => dataDir('web-sessions.json')
@@ -21,6 +21,18 @@ function loadSessions() {
 }
 function saveSessions(s) {
   writeJson(sessionsFile(), s)
+}
+
+// #8：web-sessions.json 以前是 load→改→save 整份无锁写，两个进程同时登录/登出会互相盖掉。
+// 写操作统一进锁（读保持同步：writeJson 是原子替换，读到的永远是完整文件）。
+const SESSIONS_LOCK = { staleMs: 10000, timeoutMs: 8000 }
+async function updateSessions(mutator) {
+  return withFileLock('web-sessions', () => {
+    const s = loadSessions()
+    const out = mutator(s)
+    saveSessions(s)
+    return out
+  }, SESSIONS_LOCK)
 }
 
 export function needSetup() {
@@ -56,16 +68,16 @@ export function verify(username, password) {
   return acc
 }
 
-export function issueSession(account) {
+export async function issueSession(account) {
   const token = randomUUID()
-  const s = loadSessions()
-  s[token] = {
-    subject: account.subject,
-    role: account.role,
-    level: account.level || (account.role === 'owner' ? 'full' : 'social'),
-    at: Date.now(),
-  }
-  saveSessions(s)
+  await updateSessions((s) => {
+    s[token] = {
+      subject: account.subject,
+      role: account.role,
+      level: account.level || (account.role === 'owner' ? 'full' : 'social'),
+      at: Date.now(),
+    }
+  })
   return token
 }
 
@@ -75,18 +87,16 @@ export function sessionUser(token) {
   const rec = s[token]
   if (!rec) return null
   if (Date.now() - rec.at > SESSION_TTL_MS) {
-    delete s[token]
-    saveSessions(s)
+    // #8：过期清理是写操作，异步进锁做；读接口本身保持同步。
+    updateSessions((d) => { delete d[token] }).catch(() => {})
     return null
   }
   return rec
 }
 
-export function dropSession(token) {
+export async function dropSession(token) {
   if (!token) return
-  const s = loadSessions()
-  delete s[token]
-  saveSessions(s)
+  await updateSessions((s) => { delete s[token] }).catch(() => {})
 }
 
 export function ownerInfo() {
@@ -112,7 +122,7 @@ function nextGuestId(u) {
   return ids.length ? Math.max(...ids) + 1 : 1
 }
 
-export function createGuest({ username, displayName, note, level }) {
+export function createGuest({ username, displayName, note }) {
   const u = loadUsers()
   if (!u.owner) return { ok: false, reason: '还没有主人' }
   if (!username) return { ok: false, reason: '用户名不能为空' }
@@ -127,7 +137,8 @@ export function createGuest({ username, displayName, note, level }) {
     username: String(username),
     displayName: String(displayName || username),
     note: String(note || ''),
-    level: level === 'full' ? 'full' : 'social',
+    // 默认只聊天。完全权限是主人事后手动点开的白名单，不在创建时一把全开（#44）。
+    level: 'social',
     salt,
     hash: hashPassword(password, salt),
     createdAt: Date.now(),
@@ -136,10 +147,28 @@ export function createGuest({ username, displayName, note, level }) {
   return { ok: true, subject, id, username: String(username), password }
 }
 
-export function updateGuest(subject, { displayName, note, username, password, level }) {
+// 改权限要立刻作用到已登录的会话，否则客人要等重新登录才生效。
+async function syncSessionLevels(subject, level) {
+  try {
+    await updateSessions((s) => {
+      for (const rec of Object.values(s)) {
+        if (rec && rec.subject === subject) rec.level = level
+      }
+    })
+  } catch (error) {
+    // 写不进锁就退回旧行为（最多这一次没同步），别让改权限整单失败。
+    const s = loadSessions()
+    for (const rec of Object.values(s)) if (rec && rec.subject === subject) rec.level = level
+    saveSessions(s)
+  }
+}
+
+export async function updateGuest(subject, { displayName, note, username, password, level, confirm } = {}) {
   const u = loadUsers()
   const g = u.guests[subject]
   if (!g) return { ok: false, reason: '没有这个客人' }
+  // #4：给客人开完全权限要二次确认（前端 confirm 后带 confirm:true），防误点一键开总闸。
+  if (level === 'full' && confirm !== true) return { ok: false, reason: '给客人完全权限需要二次确认' }
   if (displayName !== undefined) g.displayName = String(displayName)
   if (note !== undefined) g.note = String(note)
   if (username !== undefined && username !== '') g.username = String(username)
@@ -150,6 +179,7 @@ export function updateGuest(subject, { displayName, note, username, password, le
     g.hash = hashPassword(password, g.salt)
   }
   saveUsers(u)
+  if (level === 'full' || level === 'social') await syncSessionLevels(subject, g.level)
   return { ok: true }
 }
 

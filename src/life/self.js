@@ -64,33 +64,75 @@ export function createSelf({ life, dsh, getConfig, log = console }) {
   // 合并进 state.self：同 label 只叠 conf / 合并 ev，不重复；每类最多 MAX_PER_FIELD 条。
   async function merge(extracted, { now = Date.now() } = {}) {
     if (!extracted) return null
-    const s = life.load()
-    const cur = s.self || { version: 0, updatedAt: 0, traits: [], values: [], boundaries: [] }
-    const next = { ...cur }
+    // #13：以前先 life.load() 算完再整块写回——两个进程同时反省会互相覆盖，version 还会倒退。
+    // 现在整个「读-算-写」都在 life.update 的锁内完成。
+    return life.update((s) => {
+      const cur = s.self || { version: 0, updatedAt: 0, traits: [], values: [], boundaries: [] }
+      const next = { ...cur }
 
-    for (const field of FIELDS) {
-      const arr = (Array.isArray(cur[field]) ? cur[field] : []).map((e) => ({ ...e, ev: [...(e.ev || [])] }))
-      for (const entry of Array.isArray(extracted[field]) ? extracted[field] : []) {
-        if (!entry || !entry.label) continue
-        const label = String(entry.label).trim().slice(0, 60)
-        if (!label) continue
-        const conf = Math.max(0, Math.min(1, numOr(entry.conf, 0.5)))
-        const ev = (Array.isArray(entry.ev) ? entry.ev : []).map((x) => String(x).replace(/^#/, '').trim()).filter(Boolean)
-        const existing = arr.find((e) => e.label === label)
-        if (existing) {
-          existing.conf = Math.max(Number(existing.conf) || 0, conf)
-          existing.ev = [...new Set([...(existing.ev || []), ...ev])].slice(0, 12)
-        } else {
-          arr.push({ label, conf, src: entry.src || 'inferred', ev: ev.slice(0, 12) })
+      for (const field of FIELDS) {
+        const arr = (Array.isArray(cur[field]) ? cur[field] : []).map((e) => ({ ...e, ev: [...(e.ev || [])] }))
+        for (const entry of Array.isArray(extracted[field]) ? extracted[field] : []) {
+          if (!entry || !entry.label) continue
+          const label = String(entry.label).trim().slice(0, 60)
+          if (!label) continue
+          const conf = Math.max(0, Math.min(1, numOr(entry.conf, 0.5)))
+          const ev = (Array.isArray(entry.ev) ? entry.ev : []).map((x) => String(x).replace(/^#/, '').trim()).filter(Boolean)
+          const existing = arr.find((e) => e.label === label)
+          if (existing) {
+            existing.conf = Math.max(Number(existing.conf) || 0, conf)
+            existing.ev = [...new Set([...(existing.ev || []), ...ev])].slice(0, 12)
+          } else {
+            arr.push({ label, conf, src: entry.src || 'inferred', ev: ev.slice(0, 12) })
+          }
         }
+        next[field] = arr.sort((a, b) => (Number(b.conf) || 0) - (Number(a.conf) || 0)).slice(0, MAX_PER_FIELD)
       }
-      next[field] = arr.sort((a, b) => (Number(b.conf) || 0) - (Number(a.conf) || 0)).slice(0, MAX_PER_FIELD)
-    }
 
-    next.updatedAt = now
-    next.version = (Number(cur.version) || 0) + 1
-    await life.update((s) => { s.self = next })
-    return next
+      next.updatedAt = now
+      next.version = (Number(cur.version) || 0) + 1
+      s.self = next
+      return next
+    })
+  }
+
+  // #6/#13：自我演化不只发生在「记忆重放」里——聊得深/情绪重的那几轮，
+  // 也可以从对话原文里想一想「我是什么样的人」。仍然只叠加/提高可信度，不覆盖出厂人设。
+  // 返回 { merged, extracted }；节流与触发由调用方（host）负责。
+  async function consider({ recent = [], chemistry = null, now = Date.now() } = {}) {
+    const turns = (Array.isArray(recent) ? recent : [])
+      .filter((m) => m && m.text && !String(m.text).startsWith('【系统'))
+      .slice(-8)
+      .map((m) => `${m.who === 'bot' ? '她' : '对方'}：${String(m.text).slice(0, 200)}`)
+    if (!turns.length) return { merged: false, extracted: null }
+    const cur = list()
+    const existing = FIELDS.flatMap((f) => (cur[f] || []).map((e) => e.label)).filter(Boolean)
+    const system = [
+      '你在帮一个叫 AuraLife 的聊天角色从刚才这段对话里认识 Ta 自己（不是认识对方）。',
+      '看看这几轮里 Ta 表现出的性格特质、看重的价值、或触及的底线；只输出能站得住的，每类最多 2 条。',
+      '新条目要和已有认知不同（已有：' + (existing.join('、') || '无') + '），没有就什么都不输出。',
+      '只输出 JSON：{"traits":[{"label":"…","conf":0.6}],"values":[…],"boundaries":[…]}.',
+    ].join('\n')
+    const chem = chemistry && Number.isFinite(Number(chemistry.cortisol))
+      ? `\n（她此刻皮质醇 ${Math.round(Number(chemistry.cortisol))}、多巴胺 ${Math.round(Number(chemistry.dopamine) || 0)}、血清素 ${Math.round(Number(chemistry.serotonin) || 0)}）`
+      : ''
+    const out = await askModel(dsh, {
+      cfg: cfg(),
+      system,
+      text: turns.join('\n') + chem,
+      maxTokens: 600,
+      temperature: 0.2,
+      preferLowEffort: true,
+    })
+    const m = String(out || '').match(/\{[\s\S]*\}/)
+    let parsed = null
+    try { parsed = m ? JSON.parse(m[0]) : null } catch {}
+    if (!parsed) return { merged: false, extracted: null }
+    const pick = (k) => (Array.isArray(parsed[k]) ? parsed[k] : []).slice(0, 2)
+    const extracted = { traits: pick('traits'), values: pick('values'), boundaries: pick('boundaries') }
+    if (!FIELDS.some((f) => extracted[f].length)) return { merged: false, extracted: null }
+    const merged = await merge(extracted, { now })
+    return { merged: Boolean(merged), extracted }
   }
 
   // 注入片段（供 runtime persona 用）：把自我认知标成「逐渐形成的」，不冒充出厂人设。
@@ -103,5 +145,5 @@ export function createSelf({ life, dsh, getConfig, log = console }) {
     return parts.length ? '你逐渐形成的自我认知：' + parts.join('；') + '。' : ''
   }
 
-  return { list, reset, extract, merge, contextLine }
+  return { list, reset, extract, merge, consider, contextLine }
 }

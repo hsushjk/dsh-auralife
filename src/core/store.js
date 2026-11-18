@@ -1,6 +1,6 @@
 // —— 数据目录与 JSON 持久化（AuraLife 自己写的实现，2026-11 重写）——// 所有可写数据都放在 DSH 的插件数据目录下：
 //   <DSH_HOME>/plugins-data/auralife/…（可用 AURALIFE_DATA_DIR 覆盖，测试用）
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync, openSync, closeSync, existsSync, renameSync, copyFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, openSync, closeSync, existsSync, renameSync, copyFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 
@@ -76,7 +76,9 @@ export { existsSync }
 // fn 可以是同步函数也可以是 async 函数：返回值原样返回，抛错原样抛出，
 // 但无论走哪条路，心跳 interval 和锁文件都在 finally 里释放。
 const lockFileFor = (name) => dataDir('locks', `${name}.lock.json`)
-const lockSleep = (ms) => new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, ms)); t.unref?.() })
+// 等锁的让出：不能 unref——调用方正在 await 这把锁，把定时器 unref 掉会让事件循环在
+// 「只剩等锁」时直接空掉（Node 会报 unsettled top-level await / 进程提前退出）。
+const lockSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, Math.max(0, ms)) })
 
 // 抢一次锁：成功返回 fd；被别的进程持有返回 null（顺手清掉超过 staleMs 的僵尸锁）。
 function tryAcquireFileLock(lockFile, staleMs) {
@@ -89,7 +91,13 @@ function tryAcquireFileLock(lockFile, staleMs) {
       const abandoned = !owner || Date.now() - (owner.at || 0) > staleMs
       if (abandoned) unlinkSync(lockFile)
     } catch {
-      try { unlinkSync(lockFile) } catch { /* 别人刚好拿走 */ }
+      // 解析失败有两种情况：①持有者刚 openSync 成功、内容还没写完（0 字节或半截 JSON）——
+      // 这是「活锁」，绝对不能删；②文件真的被写坏/残留。
+      // 区分方法：只有文件本身已经存在超过 staleMs（mtime 说明没人刷新心跳）才当僵尸删掉。
+      try {
+        const st = statSync(lockFile)
+        if (Date.now() - st.mtimeMs > staleMs) unlinkSync(lockFile)
+      } catch { /* 文件已消失：别人刚好拿走/释放 */ }
     }
     return null
   }
@@ -120,11 +128,26 @@ export async function withFileLock(name, fn, opts = {}) {
     closeSync(fd)
   }
   // 心跳：长任务（几秒钟以上的 LLM 调用）里定期刷新 at，防止被别的进程当死锁抢走。
-  // release 校验持有者：锁被抢走后旧持有者不能误删新持有者的锁文件。
+  // 关键：心跳写回前必须先校验锁文件里的 token 还是自己的——如果锁已经被 stale 逻辑抢走、
+  // 换了新持有者，旧进程的心跳绝不能把 token 踩回自己（否则新持有者释放时校验不通过、
+  // 锁文件留下来，而旧进程 finally 又会把别人的锁删掉）。
+  // release 同样校验持有者，且「已经丢锁」时什么都不做。
   let heart = null
+  let lost = false
   if (staleMs > 2000) {
     heart = setInterval(() => {
-      try { writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now(), token }), 'utf8') } catch { /* 锁已被抢走，心跳失败就失败 */ }
+      try {
+        const owner = JSON.parse(readFileSync(lockFile, 'utf8'))
+        if (!owner || owner.token !== token) {
+          lost = true
+          try { clearInterval(heart) } catch { /* 无所谓 */ }
+          return
+        }
+        writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now(), token }), 'utf8')
+      } catch {
+        lost = true
+        try { clearInterval(heart) } catch { /* 无所谓 */ }
+      }
     }, Math.max(500, Math.floor(staleMs / 3)))
     try { heart.unref?.() } catch { /* 无所谓 */ }
   }
@@ -132,9 +155,11 @@ export async function withFileLock(name, fn, opts = {}) {
     return await fn()
   } finally {
     if (heart) clearInterval(heart)
-    try {
-      const owner = JSON.parse(readFileSync(lockFile, 'utf8'))
-      if (owner && owner.token === token) unlinkSync(lockFile)
-    } catch { /* 已释放 */ }
+    if (!lost) {
+      try {
+        const owner = JSON.parse(readFileSync(lockFile, 'utf8'))
+        if (owner && owner.token === token) unlinkSync(lockFile)
+      } catch { /* 已释放 */ }
+    }
   }
 }

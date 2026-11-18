@@ -111,7 +111,9 @@ export function buildTools(deps, { chat, level, sessionId }) {
     }))
   }
 
-  if (level === 'full') {
+  // #4：客人即使被主人开了 full，也只保留「聊天 + 记忆」这些工具；
+  // 改人格/写记忆/替她发消息/装器官这类总闸只对主人本人打开。
+  if (level === 'full' && isOwner) {
     tools.push(defineTool({
       name: 'web_manage_organ',
       description: '管理你自己的器官（能力模块）。action=list 看现在有哪些器官；action=remove 卸载一个不想再要的自写器官（自己写的才能卸，内置的卸不掉）。器官坏了、没用了就卸。你写的器官落盘立即生效，没有审批。',
@@ -392,7 +394,7 @@ export function buildTools(deps, { chat, level, sessionId }) {
       properties: { query: str('想找什么') },
       required: ['query'],
       execute: async ({ query }) => {
-        const r = memory.recall(String(query || ''), { about: isOwner ? 'owner' : chat.userId, limit: 8 })
+        const r = memory.recall(String(query || ''), { about: isOwner ? 'owner' : chat.userId, chatId: current, limit: 8 })
         return r.lines.length ? { ok: true, message: r.lines.join('；') } : { ok: true, message: '没想起相关的事' }
       },
     }))
@@ -414,7 +416,7 @@ export function buildTools(deps, { chat, level, sessionId }) {
     }))
   }
 
-  if (level === 'full' && !isSystem) {
+  if (level === 'full' && isOwner && !isSystem) {
     tools.push(defineTool({
       name: 'web_send_image',
       description: '把本机上已经存在的一张图片文件发到当前聊天里（比如你自己用代码画的图）。path 是图片的完整路径。',

@@ -8,6 +8,10 @@
 // 兜底 encode 漏掉的 supersede（主人某句话隐含推翻旧事实，但编码时 LLM 没识别出 op=update）。
 import { askModel } from '../core/llm.js'
 import { numOr } from '../core/store.js'
+import { isStateful } from './similar.js'
+
+const AUDIT_COOLDOWN_STATE_MS = 2 * 86400_000 // 状态型事实最多每 2 天审一次（别再天天烧审计模型）
+const AUDIT_COOLDOWN_FACT_MS = 7 * 86400_000 // 一般事实 7 天内审过就不再排进来
 
 function extractJson(raw) {
   if (!raw) return null
@@ -21,11 +25,18 @@ function extractJson(raw) {
 export function createAssess({ dsh, getConfig, store, log = console }) {
   async function auditFacts(now = Date.now()) {
     const candidates = store.currentFacts().filter((f) => {
-      if (f.archived) return false // 硬档（承诺/底线/雷点）永不审计
+      // 状态型事实（bug 在不在、版本多少、某功能开没开）会被现实事件推翻：
+      // 它们记下来往往是硬档 0.9，以前从出生就没资格被复审，「修好了」也永远挂着（#15）。
+      const stateful = f.kind === 'state' || isStateful(f.text)
+      if (f.archived && !stateful) return false // 承诺/底线/雷点这类硬档不审
       const conf = numOr(f.conf, 0.5)
-      if (conf < 0.3 || conf >= 0.8) return false // 太低不值得审、太高是硬性事实
+      if (conf < 0.3) return false
+      if (!stateful && conf >= 0.8) return false // 高可信的偏好事实不值得反复审
+      // 审计冷却：状态型 2 天一次、普通事实 7 天一次，避免同一批事实反复占审计预算（复查 #8）。
+      const sinceAudit = now - numOr(f.lastAuditAt, 0)
+      if (f.lastAuditAt && sinceAudit < (stateful ? AUDIT_COOLDOWN_STATE_MS : AUDIT_COOLDOWN_FACT_MS)) return false
       const age = (now - Math.max(f.t0 || 0, f.lastHit || 0)) / 86400_000
-      return age >= 3 // 至少 3 天没被碰过的才审
+      return stateful ? age >= 1 : age >= 3 // 状态型 1 天就可能过期
     })
     if (!candidates.length) return { audited: 0, outdated: [] }
 
@@ -37,7 +48,7 @@ export function createAssess({ dsh, getConfig, store, log = console }) {
       .map((e) => `- ${e.summary}`)
       .join('\n') || '（没有最近的事件记录）'
 
-    const system = '你是记忆审计员。下面是「记住的关于用户的事实」和「用户最近发生的事件」。判断哪些事实已经过时、被推翻、不再成立（用户改了主意、换了喜好、情况变了）。只输出 JSON：{"outdated":["id"...]}，一条都没有就输出 {"outdated":[]}。不要解释。'
+    const system = '你是记忆审计员。下面是「记住的关于用户的事实」和「用户最近发生的事件」。判断哪些事实已经过时、被推翻、不再成立（用户改了主意、换了喜好、情况变了）。特别注意：如果最近的事件表明某个 bug/问题已经修好、某个版本已经升级、某个状态已经改变，就把对应的旧事实判为 outdated（事件推翻陈述，不是新增一条陈述）。只输出 JSON：{"outdated":["id"...]}，一条都没有就输出 {"outdated":[]}。不要解释。'
 
     const outdated = []
     const BATCH = 8
@@ -61,6 +72,10 @@ export function createAssess({ dsh, getConfig, store, log = console }) {
           outdated.push({ id: String(id), text: f.text })
           log.info(`审计遗忘：「${f.text.slice(0, 40)}」`)
         }
+      }
+      // 这批不管审出什么，都记「刚审过」，避免下一次重放又把这批事实送进模型。
+      for (const f of batch) {
+        store.markAudited(f.id, now).catch((error) => log.warn('审计标记写失败：' + (error?.message || error)))
       }
     }
     return { audited: candidates.length, outdated }

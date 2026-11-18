@@ -18,11 +18,20 @@ export function scoreText(text) {
 }
 
 // 每轮聊完的「社交情绪 → 内分泌」判断（原 mood.judge，去掉了心情存储）。
-// 返回 { delta: -15~15, reason, confidence } 或 null（判断失败）。
+// #35：规则优先——词表已经给出明确方向就直接返回，不再每轮白烧一次模型调用；
+// 没信号、也不像有情绪的消息直接返回 null；只有拿不准时才问模型。
+// 返回 { delta: -15~15, reason, confidence, source: 'rule'|'model' } 或 null（不值得判断）。
 export async function judgeChem({ dsh, getConfig, life, userText, reply, who = '对方', origin = 'user' }) {
   const full = getConfig()
   const bot = life?.load?.().identity?.name || full.botName || 'AuraLife'
-  if (!dsh) return null
+  const said = String(userText || '')
+  const answered = String(reply || '')
+  const rule = scoreText(said) + Math.round(scoreText(answered) * 0.5)
+  if (rule >= 8) return { delta: Math.min(15, Math.round(rule / 2)), reason: '词表：聊得开心', confidence: 0.6, source: 'rule' }
+  if (rule <= -8) return { delta: Math.max(-15, Math.round(rule / 2)), reason: '词表：聊得难受', confidence: 0.6, source: 'rule' }
+  // 拿不准才问模型：有残余信号、有语气/疑问、或对方说了较长一段。
+  const worthAsking = rule !== 0 || /[?？!！…]|算了|随便|没事|呵呵|唉|呜|哼|哦|嗯|罢了|行吧/.test(`${said}\n${answered}`) || said.length >= 24
+  if (!dsh || !worthAsking) return null
   const scene = origin === 'speak-up' ? `这一轮是${bot}自己想${who}了、主动去找${who}说话（不是被叫来干活）` : `这一轮是${who}在跟${bot}说话`
   try {
     const { askModel } = await import('../core/llm.js')

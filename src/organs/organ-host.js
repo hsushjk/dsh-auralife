@@ -144,13 +144,20 @@ export function createOrganHost({ dsh, getConfig, log }) {
     return out
   }
 
-  const contextLine = () => {
+  // 能力清单单独拆出来（#7）：清单是「我有什么器官」，可以会话级缓存；
+  // 而器官的 contextLine 是「此刻的身体状态」，每轮说话都要按最新数值重算。
+  const capabilityLine = () => {
     const active = [...organs.values()].filter((o) => o.status === 'active')
     if (!active.length) return ''
     const lines = active.map((o) => `- ${o.name}（${o.id}）：${o.description}`)
     const tail = '如果遇到超出这些能力的事，说明你可能缺一个器官，你可以自己写一个新的补上（写出来立即生效，没有审批）。'
-    const head = ['你此刻拥有的能力（器官）：', ...lines, tail].join('\n')
+    return ['你此刻拥有的能力（器官）：', ...lines, tail].join('\n')
+  }
+
+  const contextLine = () => {
+    const head = capabilityLine()
     // 聚合绑定器官的「当下状态 / 说话方式」行为指令（mood/chemistry/energy 等，遵守内感受铁律不报数）。
+    const active = [...organs.values()].filter((o) => o.status === 'active')
     const directives = []
     for (const o of active) {
       if (!o.instance || typeof o.instance.contextLine !== 'function') continue
@@ -382,6 +389,25 @@ export function createOrganHost({ dsh, getConfig, log }) {
     return out
   }
 
+  // 器官目录签名：目录里所有文件（含拆出来的子模块）的路径+大小+mtime。
+  // 只盯 manifest/index 会漏掉「器官拆成多个文件、改的是别的文件」的情况（#39）。
+  const signatureOf = (dirPath) => {
+    const parts = []
+    const walk = (d, rel) => {
+      let list = []
+      try { list = readdirSync(d, { withFileTypes: true }) } catch { return }
+      list.sort((a, b) => (a.name < b.name ? -1 : 1))
+      for (const ent of list) {
+        const p = join(d, ent.name)
+        const r = rel ? `${rel}/${ent.name}` : ent.name
+        if (ent.isDirectory()) { walk(p, r); continue }
+        try { const st = statSync(p); parts.push(`${r}:${st.size}:${st.mtimeMs}`) } catch {}
+      }
+    }
+    walk(dirPath, '')
+    return parts.join(',')
+  }
+
   // 扫描 self-made 目录：全 AI 托管，磁盘上有的器官一律热加载。
   // self-made 器官跑在独立 Worker 里：加载失败/死循环/process.exit 只影响它自己。
   const loadSelfMade = async () => {
@@ -411,9 +437,10 @@ export function createOrganHost({ dsh, getConfig, log }) {
       if (!existsSync(manifestPath) || !existsSync(indexPath)) continue
       const manifest = readJson(manifestPath, null)
       if (!manifest || !manifest.id) continue
-      // 幂等：已热加载且 worker 活着的 active 器官跳过。
+      // 幂等：已热加载、worker 活着、且目录签名没变才跳过。目录里任何文件改了都要重载（#39）。
+      const sig = signatureOf(dirPath)
       const existing = organs.get(manifest.id)
-      if (existing && existing.status === 'active' && existing.instance && !(existing.runtime && existing.runtime.failed)) continue
+      if (existing && existing.status === 'active' && existing.instance && !(existing.runtime && existing.runtime.failed) && existing.runtime && existing.runtime.sign === sig) continue
       if (existing && existing.runtime) stopRuntime(existing.runtime, 'reload')
       const code = readFileSync(indexPath, 'utf8')
       const g = guardOrgan(code)
@@ -428,6 +455,7 @@ export function createOrganHost({ dsh, getConfig, log }) {
         const meta = { ...manifest, ...(info.meta || {}) }
         const id = String(meta.id || manifest.id)
         rt.id = id
+        rt.sign = sig
         rt.toolDescs = Array.isArray(info.tools) ? info.tools : []
         rt.contextLine = String(info.contextLine || '')
         const defs = rt.toolDescs.map((desc) => toolDefFor(rt, desc))
@@ -467,6 +495,9 @@ export function createOrganHost({ dsh, getConfig, log }) {
       try {
         if (o.runtime && (o.runtime.failed || o.runtime.stopped)) throw new Error('器官进程已崩溃/停止')
         const r = await o.instance.tick()
+        // 成功一次就把异常计数清零：熔断语义是「连续 3 次」，不是「累计 3 次」。
+        // 长期运行的器官偶尔抽一次不该被永久熔断。
+        trips.delete(id)
         results.push({ id, ok: true, result: r })
       } catch (e) {
         const n = (trips.get(id) || 0) + 1
@@ -497,7 +528,7 @@ export function createOrganHost({ dsh, getConfig, log }) {
 
   // 磁盘快照比对：DSH 是多进程（web 进程答 API、agent 进程跑聊天），各进程的 organs Map 各自为政。
   // bootstrap 在 agent 进程落盘、remove 在任一进程删目录——对端进程必须重扫磁盘才能看到。
-  // 快照 = 目录 mtime + 每个器官目录的 manifest/index.js mtime，变了才重扫（loadSelfMade 本身幂等）。
+  // 快照 = 目录 mtime + 每个器官目录的完整签名（含拆出来的子模块），变了才重扫（loadSelfMade 本身幂等）。
   let lastScanKey = ''
   const scanKey = () => {
     const dir = selfMadeDir()
@@ -505,11 +536,7 @@ export function createOrganHost({ dsh, getConfig, log }) {
     let key = String(statSync(dir).mtimeMs)
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue
-      const sub = join(dir, entry.name)
-      for (const f of ['manifest.json', 'index.js']) {
-        const p = join(sub, f)
-        key += '|' + entry.name + ':' + f + ':' + (existsSync(p) ? statSync(p).mtimeMs : '-')
-      }
+      key += '|' + entry.name + ':' + signatureOf(join(dir, entry.name))
     }
     return key
   }
@@ -525,5 +552,5 @@ export function createOrganHost({ dsh, getConfig, log }) {
     }
   }
 
-  return { register, registerBuiltins, list, capabilities, contextLine, loadSelfMade, remove, bind, tickAll, toolDefs, organs, refreshIfChanged, audit }
+  return { register, registerBuiltins, list, capabilities, contextLine, capabilityLine, loadSelfMade, remove, bind, tickAll, toolDefs, organs, refreshIfChanged, audit }
 }

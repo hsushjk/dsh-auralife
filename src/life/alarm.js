@@ -31,13 +31,48 @@ export function createAlarm({ life, log }) {
     })
   }
 
-  // 扫到期的闹钟，返回并按时间升序标记 fired。drive 心跳里每次调一次。
+  // 扫到期的闹钟：只「认领」不标 fired（#31）。
+  // 以前在 life.update 里先标 fired 再返回去发——fireAlarm 抛错（模型挂/被静默）这条提醒就永久丢了。
+  // 现在两段式：fireDue 认领（claimedAt，多进程不会重复响）→ 发成功 markFired，失败 failFired 退避重试。
   function fireDue(now = Date.now()) {
     return life.update((s) => {
-      const due = s.alarms.filter((a) => !a.fired && a.at <= now).sort((a, b) => a.at - b.at)
-      if (!due.length) return []
-      for (const a of due) a.fired = true
-      return due
+      const due = s.alarms
+        .filter((a) => !a.fired && !(a.claimedAt && now - a.claimedAt < 2 * 60_000) && a.at <= now)
+        .sort((a, b) => a.at - b.at)
+      for (const a of due) a.claimedAt = now
+      return due.map((a) => ({ ...a }))
+    })
+  }
+
+  // 发成功：落 fired。
+  function markFired(id, now = Date.now()) {
+    return life.update((s) => {
+      const a = s.alarms.find((x) => x.id === id)
+      if (!a) return false
+      a.fired = true
+      a.firedAt = now
+      a.claimedAt = 0
+      delete a.lastError
+      return true
+    })
+  }
+
+  // 发失败：记一次重试（最多 2 次），下一轮再响；两次都失败才放弃（标 fired 防死循环），并留下 lastError。
+  function failFired(id, error = '', now = Date.now()) {
+    return life.update((s) => {
+      const a = s.alarms.find((x) => x.id === id)
+      if (!a) return false
+      a.attempts = (Number(a.attempts) || 0) + 1
+      a.claimedAt = 0
+      a.lastError = String(error || '').slice(0, 200)
+      if (a.attempts >= 2) {
+        a.fired = true
+        a.firedAt = now
+        log?.warn(`闹钟「${a.reason || a.id}」两次都没发出去，放弃：${a.lastError}`)
+        return { ok: false, gaveUp: true }
+      }
+      log?.warn(`闹钟「${a.reason || a.id}」发送失败，稍后重试（第 ${a.attempts} 次）：${a.lastError}`)
+      return { ok: false, retry: true }
     })
   }
 
@@ -57,5 +92,5 @@ export function createAlarm({ life, log }) {
     })
   }
 
-  return { setAlarm, fireDue, list, cancel }
+  return { setAlarm, fireDue, markFired, failFired, list, cancel }
 }

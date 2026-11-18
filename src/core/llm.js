@@ -23,7 +23,16 @@ async function supportedEfforts(llm, provider, model) {
   let list = null
   try {
     if (typeof llm.resolveModelInfo === 'function') {
-      const info = await llm.resolveModelInfo(provider, model)
+      // #16a：宿主查询能力信息也可能挂住，别让它拖死整轮/整次整理。
+      // 注意定时器不能 unref：调用方正 await 这个 race，事件循环不能因为只剩它而提前空掉。
+      let timer = null
+      const slow = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('模型能力查询超时')), 5000) })
+      let info
+      try {
+        info = await Promise.race([llm.resolveModelInfo(provider, model), slow])
+      } finally {
+        clearTimeout(timer)
+      }
       if (info && info.reasoning) list = (info.reasoning.efforts || []).map((e) => String(e?.id ?? e))
     }
   } catch { list = null }
@@ -46,6 +55,32 @@ async function runStream(llm, req) {
   return out.trim()
 }
 
+// 内部调用也要有超时：模型挂住时不能把调用方（比如记忆整理）一起拖死（#46）。
+const DEFAULT_TIMEOUT_MS = 120_000
+
+function timeoutOf(o) {
+  const n = Number(o?.timeoutMs)
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT_MS
+  return Math.min(600_000, Math.max(1000, Math.round(n)))
+}
+
+async function runWithTimeout(llm, req, timeoutMs) {
+  const ctl = new AbortController()
+  let timer = null
+  // 不依赖底层是否真的响应 abort：超时了就自己把 Promise race 掉（#46）。
+  const timeoutError = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      ctl.abort()
+      reject(new Error(`模型调用超时（${Math.round(timeoutMs / 1000)} 秒）`))
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([runStream(llm, { ...req, signal: ctl.signal }), timeoutError])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function askModel(dsh, o) {
   const llm = dsh.llm || dsh.get('llm')
   if (!llm || typeof llm.stream !== 'function') throw new Error('宿主没有 llm 服务')
@@ -61,6 +96,7 @@ export async function askModel(dsh, o) {
   }
   const messages = [{ role: 'user', id: randomUUID(), content, source: { kind: 'plugin', plugin: 'auralife' } }]
   const baseMax = Math.max(1, Number(o.maxTokens) || 600)
+  const timeoutMs = timeoutOf(o)
 
   // 思考强度优先级：显式传 > preferLowEffort 探测 > 配置默认。
   // preferLowEffort 只给内部结构化调用用；聊天/开口这类正文生成仍然尊重她的配置。
@@ -87,14 +123,22 @@ export async function askModel(dsh, o) {
 
   let out
   try {
-    out = await runStream(llm, request(effort, baseMax))
+    out = await runWithTimeout(llm, request(effort, baseMax), timeoutMs)
   } catch (error) {
     if (!EFFORT_UNSUPPORTED.test(String(error?.message || error))) throw error
     // 宿主不认这个思考强度（不 clamp 也不别名，直接 throw）：退到宿主默认，放大预算再试一次。
-    return runStream(llm, request(null, Math.max(1200, baseMax * 4)))
+    return runWithTimeout(llm, request(null, Math.max(1200, baseMax * 4)), timeoutMs)
   }
   if (out) return out
   // 正文为空：多半是思考 token 吃光了预算（适配器不支持 off 时尤其常见）。
-  // 退到宿主默认强度 + 放大预算，再给一次机会。
-  return runStream(llm, request(null, Math.max(1200, baseMax * 4)))
+  // 放大预算再给一次机会；#16b：preferLowEffort 的内部调用重试时也别偷偷退回高思考强度。
+  let retryEffort = null
+  if (o.preferLowEffort) {
+    retryEffort = effort || null
+    if (!retryEffort) {
+      const supported = await supportedEfforts(llm, t.provider, t.model)
+      retryEffort = supported && supported.length ? (LOW_EFFORTS.find((id) => supported.includes(id)) || null) : null
+    }
+  }
+  return runWithTimeout(llm, request(retryEffort, Math.max(1200, baseMax * 4)), timeoutMs)
 }

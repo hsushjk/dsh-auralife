@@ -43,21 +43,41 @@ export function createReplay({ store, life, self, dsh, getConfig, log = console 
       for (const eid of f.ev || []) if (epById.has(eid)) push(f.id, eid, 'evidence', 1, 'episode')
     }
 
-    // assoc：同主体（subj 或 aboutName）两两，Jaccard 相似度做权重（>0.15 才连）
+    // assoc：同主体（subj 或 aboutName）两两，Jaccard 相似度做权重（>0.15 才连）；
+  // 没有主体的（客人随口一句/自述）按 chatId 分组，别让它们连建边资格都没有（#16）。
     const bySubj = new Map()
     for (const f of fs) {
-      const k = (f.subj || f.aboutName || '').trim()
+      const explicit = (f.subj || f.aboutName || '').trim()
+      const k = explicit || (f.chatId ? `chat:${f.chatId}` : '')
       if (!k) continue
       if (!bySubj.has(k)) bySubj.set(k, [])
       bySubj.get(k).push(f)
     }
     for (const [, group] of bySubj) {
-      if (group.length < 2) continue
+      if (group.length < 2 || group.length > 40) continue
       for (let i = 0; i < group.length; i++)
         for (let j = i + 1; j < group.length; j++) {
           const w = similarity(group[i].text, group[j].text)
           if (w > 0.15) push(group[i].id, group[j].id, 'assoc', Number(w.toFixed(3)), 'same-subject')
         }
+    }
+
+    // relink：事实 supersede 后旧 id 变成死行，旧边还连着死行 → 新版本一条边都没有。
+    // 把指向旧 id 的边迁到版本链头上，联想才不会跟着版本链一起断掉（#16）。
+    const allFacts = store.facts()
+    const byId = new Map(allFacts.map((f) => [f.id, f]))
+    const supBy = new Map()
+    for (const f of allFacts) if (f.supersedes) supBy.set(f.supersedes, f.id)
+    const headId = (id) => {
+      let cur = id
+      const seen = new Set()
+      while (supBy.has(cur) && !seen.has(cur)) { seen.add(cur); cur = supBy.get(cur) }
+      return cur
+    }
+    for (const e of store.edges()) {
+      const a = headId(e.a)
+      const b = headId(e.b)
+      if ((a !== e.a || b !== e.b) && byId.has(a) && byId.has(b)) push(a, b, e.kind, e.w, 'relink')
     }
     return added
   }

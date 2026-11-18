@@ -6,7 +6,7 @@ import { readJson, dataDir } from '../../core/store.js'
 
 export function register(router, ctx) {
   const { json, readBody, requireOwner, getConfig, setConfig, publicConfig, ownerInfo, log, VERSION, deps } = ctx
-  const { hub, azone, drive, azoneSocial, memory, logger, asrInfo, listModels, self, life, wishes, chemistry, energy, alarm, hostInfo } = deps
+  const { hub, azone, drive, azoneSocial, memory, logger, asrInfo, listModels, self, life, wishes, chemistry, energy, alarm, sleep, hostInfo } = deps
 
   router.add('GET', 'api/config', async (req, res) => {
     const me = requireOwner(req, res); if (!me) return
@@ -104,6 +104,8 @@ export function register(router, ctx) {
       diary: azone.state(),
       diaryStats: azone.stats(),
       drive: drive.state(),
+      // 睡眠/梦是硬状态（#18）：状态栏不该只看钟点，要看她实际睡没睡、刚才做没做梦。
+      sleep: (() => { try { return sleep ? sleep.state() : null } catch { return null } })(),
       memory: memory.stats(),
       self: self ? self.list() : null,
       sessions: hub.sessions(),

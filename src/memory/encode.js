@@ -8,7 +8,7 @@
 import { askModel } from '../core/llm.js'
 import { numOr } from '../core/store.js'
 import { OWNER_ID } from '../chat/access.js'
-import { isDup, isHardFact } from './similar.js'
+import { isDup, isHardFact, normalizeText } from './similar.js'
 
 // 时间跳变阈值（毫秒）：超过这个间隔视为两个事件
 export const GAP_MS = 30 * 60 * 1000
@@ -89,10 +89,16 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
       '  "outdated" —— 旧记忆过时/被推翻（以前喜欢现在不喜欢、换工作、分手），"id" 填旧编号、"text" 写现在的新事实。',
       '拿不准是不是矛盾就当 add；和旧记忆重复、没新信息的不要输出。',
       '',
+      '每条还要带 kind（事实类型，尽量由你判断，不靠关键词猜；拿不准写 knowledge）：',
+      '  "state"      —— 现在才知道、以后会被现实推翻的状态（在忙/在不在、进度、身体状况、最近在做什么）；',
+      '  "preference" —— 稳定的喜好/讨厌/习惯/底线（爱吃什么、受不了什么、忌口）；',
+      '  "memory"     —— 你们之间发生过的事、她做过或答应过的事；',
+      '  "knowledge"  —— 一般已知信息（名字、身份、关系）。',
+      '',
       related.length
         ? '已经记得的事（#编号 是旧记忆的 id）：\n' + related.map((f) => `#${f.id} [${f.src}] ${f.aboutName ? '[' + f.aboutName + '] ' : ''}${f.text}`).join('\n') + '\n\n'
         : '',
-      '只输出一个 JSON 对象：{"summary":"这段发生了什么，一两句，无人称省略主语也行","facts":[{"op":"add","text":"…","about":"小明","about_id":"guest-1","src":"told","conf":0.6}]}。',
+      '只输出一个 JSON 对象：{"summary":"这段发生了什么，一两句，无人称省略主语也行","facts":[{"op":"add","text":"…","about":"小明","about_id":"guest-1","src":"told","conf":0.6,"kind":"preference"}]}。',
       'about 写这件事是关于谁的名字，about_id 写那个人的用户标识（owner/guest-N），不知道就不写。没有值得记的 facts 就输出空数组。',
     ].join('\n')
 
@@ -132,32 +138,89 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
       const subj = /^[a-z][\w-]*$/.test(id) ? id : (chatId && chatId !== 'azone' ? chatId : '')
       const src = ['told', 'inferred', 'self_did', 'imagined'].includes(String(x.src)) ? String(x.src) : 'inferred'
       const conf = Math.max(0, Math.min(1, numOr(x.conf, 0.5)))
+      // 事实类型交给抽取模型判断（#2）：正则只能兜底，猜错了没有纠正入口。
+      const kind = ['state', 'preference', 'knowledge', 'memory'].includes(String(x.kind || '')) ? String(x.kind) : ''
 
       const op = String(x.op || 'add')
+      // 判重/改写的范围跟 fact 的 chatId 对齐（#18）：客人会话里说的话不能并进/覆盖主人的事实，
+      // chatId 为空的事实算「全局共享」，两边都能碰。
+      const scope = String(chatId || '')
+      const inScope = (f) => {
+        if (!f) return false
+        const fc = String(f.chatId || '')
+        return fc === scope || fc === '' || scope === ''
+      }
       const targetId = String(x.id || '').replace(/^#/, '')
       const target = targetId ? store.findFact(targetId) : null
 
-      if ((op === 'update' || op === 'outdated') && target) {
-        const nf = await store.supersede(target.id, { text, subj: subj || target.subj, aboutName: x.about || target.aboutName || '', src, conf, chatId, archived: isHardFact({ text, src, conf }) })
+      if ((op === 'update' || op === 'outdated') && target && inScope(target)) {
+        const nf = await store.supersede(target.id, { text, subj: subj || target.subj, aboutName: x.about || target.aboutName || '', src, conf, kind: kind || target.kind, chatId: target.chatId || scope, archived: isHardFact({ text, src, conf }) })
         superseded++
         supersededIds.push(nf.id)
         log.info(`记忆更新：「${target.text.slice(0, 40)}」→「${text.slice(0, 40)}」(${op})`)
         continue
       }
 
-      // add：先判重（0.85 + 实体/否定词保护）
-      const dup = nowFacts.find((f) => isDup({ text, subj }, f))
+      // add：先判重（0.85 + 实体/否定词保护），范围限定在当前 chatId 可见的事实里（#18）
+      const dup = nowFacts.find((f) => inScope(f) && isDup({ text, subj }, f))
       if (dup) {
+        // 同一件事但新说法更具体时不能只 bumpHit 把细节丢光（复查 #9）：
+        // 新句明显更长 → 走 supersede 合并进版本链；否则照旧只记命中。
+        const oldText = String(dup.text || '')
+        if (text.length > oldText.length + 4 && normalizeText(text) !== normalizeText(oldText)) {
+          const nf = await store.supersede(dup.id, { text, subj: subj || dup.subj, aboutName: String(x.about || dup.aboutName || ''), src, conf, kind: kind || dup.kind, chatId: dup.chatId || scope, tags: dup.tags, archived: isHardFact({ text, src, conf }) })
+          superseded++
+          supersededIds.push(nf.id)
+          log.info(`记忆合并：「${oldText.slice(0, 40)}」→「${text.slice(0, 40)}」`)
+          continue
+        }
+        // 模型给了明确类型、旧记忆是兜底猜的 → 顺手纠正（#2：猜错了没人纠正）。
+        if (kind && kind !== 'knowledge' && (dup.kind || 'knowledge') === 'knowledge' && dup.kind !== kind) {
+          try { await store.setFactKind(dup.id, kind) } catch (error) {}
+        }
         await store.bumpHit(dup.id)
         skipped++
         continue
       }
-      const fact = store.addFact({ text, subj, aboutName: String(x.about || ''), src, conf, chatId, archived: isHardFact({ text, src, conf }), ev: [] })
+      const fact = store.addFact({ text, subj, aboutName: String(x.about || ''), src, conf, kind, chatId, archived: isHardFact({ text, src, conf }), ev: [] })
       added++
       addedIds.push(fact.id)
       log.info(`新记忆 [${src}]：${text.slice(0, 60)}`)
     }
     return { added, addedIds, superseded, supersededIds, summary: newSummary, skipped }
+  }
+
+  // #2（结构性）：历史里 kindSrc='heuristic' 的事实是正则猜出来的类型，交给模型批量纠正。
+  // 只改类型、不动内容；拿不准的条目跳过，下次再试。每类每天最多一次（由 v2 节流调用）。
+  async function fixKinds({ limit = 20 } = {}) {
+    let list = []
+    try {
+      const cap = Math.max(1, Math.min(50, Number(limit) || 20))
+      list = store.currentFacts().filter((f) => f && f.kindSrc === 'heuristic').slice(0, cap)
+    } catch { return 0 }
+    if (!list.length) return 0
+    const rows = list.map((f, i) => `${i + 1}. ${f.text}`).join('\n')
+    const system = [
+      '你在帮一个长期记忆库给事实分类。每条记忆归到四类之一：',
+      '  state —— 会过期的状态（在不在、版本多少、还没做、修好没）；',
+      '  preference —— 偏好/口味/习惯（喜欢什么、讨厌什么、爱吃什么）；',
+      '  memory —— 她做过/答应过/经历过的事（承诺、经历）；',
+      '  knowledge —— 关于人和世界的稳定事实（名字、关系、职业、住址、重要日期）。',
+      '只输出 JSON：{"kinds":[{"n":1,"kind":"preference"},{"n":2,"kind":"knowledge"}]}；拿不准的条目不输出。',
+    ].join('\n')
+    const out = await askModel(dsh, { cfg: getConfig(), system, text: rows, maxTokens: 800, temperature: 0.1, preferLowEffort: true })
+    const m = String(out || '').match(/\{[\s\S]*\}/)
+    let parsed = null
+    try { parsed = m ? JSON.parse(m[0]) : null } catch {}
+    if (!parsed || !Array.isArray(parsed.kinds)) return 0
+    let changed = 0
+    for (const item of parsed.kinds) {
+      const f = list[Number(item && item.n) - 1]
+      const kind = String((item && item.kind) || '')
+      if (!f || !['state', 'preference', 'knowledge', 'memory'].includes(kind)) continue
+      try { if (await store.setFactKind(f.id, kind)) changed++ } catch (error) {}
+    }
+    return changed
   }
 
   // 把一个 chatId 的一段原文消息编码成 episode + facts。
@@ -200,5 +263,5 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
     return { episodes, facts: { added, superseded, addedIds, supersededIds } }
   }
 
-  return { extractFacts, encodeSegment }
+  return { extractFacts, encodeSegment, fixKinds }
 }

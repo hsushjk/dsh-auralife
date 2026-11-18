@@ -10,9 +10,10 @@
 // 体量（DESIGN §5.2）：episode 200-400B/条、fact ~300B/条，一年 <5MB，
 // 启动时全量载入内存，append 只碰当月分片。
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { appendFileSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { dataDir, ensureDir, numOr, withFileLock } from '../core/store.js'
+import { inferKind } from './similar.js'
 
 export const monthKey = (t = Date.now()) => {
   const d = new Date(t)
@@ -45,13 +46,29 @@ export function createMemStore({ log = console } = {}) {
     return out
   }
 
+  // 缓存戳：facts/episodes/edges 分片文件的「名字+大小+mtime」。
+  // 别的进程往盘里追加时戳会变，本进程读到新数据（#20：以前只有本进程 append 才失效，
+  // 读路径永远拿旧缓存，别的进程刚记的事实看不见，命中计数还会被旧行覆盖回去）。
+  function stampOf(kind) {
+    const dir = dirOf(kind)
+    let names = []
+    try { names = readdirSync(dir).filter((f) => f.endsWith('.jsonl')).sort() } catch { return '' }
+    let out = ''
+    for (const n of names) {
+      try { const st = statSync(join(dir, n)); out += `${n}:${st.size}:${st.mtimeMs}|` } catch { /* 文件刚好被删就跳过 */ }
+    }
+    return out
+  }
+
   function all() {
-    if (cache) return cache
+    const stamp = `${stampOf('facts')}#${stampOf('episodes')}#${stampOf('edges')}`
+    if (cache && cache.stamp === stamp) return cache
     // 事实按 id 取「最后一行」：bumpHit 会追加同一 id 的新行（只改命中计数），
     // 后面的行是更新的状态；内容字段（t0/text/supersedes）从不改写，所以 last-wins 安全。
     const factsById = new Map()
     for (const f of loadLines(dirOf('facts'))) factsById.set(f.id, f)
     cache = {
+      stamp,
       facts: [...factsById.values()],
       factsById,
       episodes: loadLines(dirOf('episodes')),
@@ -84,6 +101,11 @@ export function createMemStore({ log = console } = {}) {
       archived: Boolean(f.archived),
       tags: Array.isArray(f.tags) ? f.tags.slice(0, 8) : [],
       chatId: String(f.chatId || ''),
+      // 事实类型：状态型（bug 在不在/版本多少）和偏好型（爱吃白米饭）不该用同一种存储语义——
+      // 状态型会被现实事件推翻、必须能复审；偏好型更稳定、按硬档处理。
+      // kind 优先用抽取模型给的（#2），没给才走正则兜底；kindSrc 留痕，方便以后纠正。
+      kind: f.kind || inferKind(f.text, f.src),
+      kindSrc: f.kindSrc || (f.kind ? 'llm' : 'heuristic'),
       ...(f.hits != null ? { hits: Number(f.hits) || 0, hitDays: Number(f.hitDays) || 0, lastHit: f.lastHit || 0 } : {}),
     }
     return append('facts', fact)
@@ -137,6 +159,9 @@ export function createMemStore({ log = console } = {}) {
   // 多进程下 find→append 的读-改-写进锁（审计：无锁 RMW）。
   function bumpHit(id, now = Date.now()) {
     return withFileLock('mem-facts', () => {
+      // 锁内读之前先丢掉进程缓存：all() 的 cache 只有本进程 append 时才失效，
+      // 别的进程刚写的新事实/新计数会被旧缓存整份覆盖回去（#14）。
+      invalidate()
       const f = findFact(id)
       if (!f) return false
       if (!f.lastHit || new Date(f.lastHit).toDateString() !== new Date(now).toDateString()) f.hitDays = (f.hitDays || 0) + 1
@@ -151,6 +176,7 @@ export function createMemStore({ log = console } = {}) {
   // 只在重放（replay.js）发生；硬档（archived）永不遗忘。
   function forget(id, now = Date.now()) {
     return withFileLock('mem-facts', () => {
+      invalidate()
       const f = findFact(id)
       if (!f || f.invalidAt) return false
       append('facts', { ...f, invalidAt: now })
@@ -161,6 +187,7 @@ export function createMemStore({ log = console } = {}) {
   // 追加新事实并让 `supersedes` 指向旧 id（旧行不改，天然版本链）
   function supersede(oldId, patch) {
     return withFileLock('mem-facts', () => {
+      invalidate()
       const old = findFact(oldId)
       const fact = addFact({
         ...patch,
@@ -177,11 +204,50 @@ export function createMemStore({ log = console } = {}) {
   // append 一行带新 ev 的同一 id（last-wins），旧行不改；幂等（去重）。
   function linkEvidence(factId, episodeId) {
     return withFileLock('mem-facts', () => {
+      invalidate()
       const f = findFact(factId)
       if (!f) return false
       const ev = Array.isArray(f.ev) ? f.ev : []
       if (ev.includes(episodeId)) return false
       append('facts', { ...f, ev: [...ev, episodeId] })
+      return true
+    }, { staleMs: 10000, timeoutMs: 5000 })
+  }
+
+  // 纠正事实类型（#2）：抽取时模型给了明确 kind、旧记忆却是正则兜底猜出来的，
+  // 就在同一 id 上追加一行修正记录（last-wins，审计留痕）。
+  function setFactKind(id, kind) {
+    return withFileLock('mem-facts', () => {
+      invalidate()
+      const f = findFact(id)
+      if (!f) return false
+      const next = String(kind || '')
+      if (!['state', 'preference', 'knowledge', 'memory'].includes(next)) return false
+      // 同一类型也要留痕：模型确认过的 kind 值得标成 llm，否则会被当成「猜的」反复送去纠正。
+      if (f.kind === next && f.kindSrc === 'llm') return false
+      append('facts', { ...f, kind: next, kindSrc: 'llm' })
+      return true
+    }, { staleMs: 10000, timeoutMs: 5000 })
+  }
+
+  // 标记「这条事实最近被主动想起/说过」（防同一句反复被忽然想起）。
+  function markSpoken(id, now = Date.now()) {
+    return withFileLock('mem-facts', () => {
+      invalidate()
+      const f = findFact(id)
+      if (!f) return false
+      append('facts', { ...f, lastSpokenAt: now })
+      return true
+    }, { staleMs: 10000, timeoutMs: 5000 })
+  }
+
+  // 标记「这条事实刚被审计过」（防状态型事实每天都被复审、天天烧模型）。
+  function markAudited(id, now = Date.now()) {
+    return withFileLock('mem-facts', () => {
+      invalidate()
+      const f = findFact(id)
+      if (!f) return false
+      append('facts', { ...f, lastAuditAt: now })
       return true
     }, { staleMs: 10000, timeoutMs: 5000 })
   }
@@ -204,6 +270,12 @@ export function createMemStore({ log = console } = {}) {
       S: e.S ?? null, // 记忆强度，Slice 4 用
       recallCount: Number(e.recallCount) || 0,
       lastRecall: e.lastRecall || 0,
+      // 梦（#24）：梦不是事实，只落 episode；kind/title/mood/materials 让以后能召回「我梦见过这件事」。
+      kind: String(e.kind || 'event').slice(0, 20),
+      title: String(e.title || '').slice(0, 40),
+      mood: String(e.mood || '').slice(0, 20),
+      materials: Array.isArray(e.materials) ? e.materials.filter((x) => typeof x === 'string' && x).slice(0, 8) : [],
+      stage: String(e.stage || '').slice(0, 10),
     }
     return append('episodes', ep)
   }
@@ -260,6 +332,7 @@ export function createMemStore({ log = console } = {}) {
     facts, episodes, edges,
     currentFacts, findFact, headOf, factsBySubj,
     bumpHit, supersede, forget, linkEvidence,
+    markSpoken, markAudited, setFactKind,
     stats, newId, monthKey, clear,
   }
 }

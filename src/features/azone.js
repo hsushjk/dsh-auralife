@@ -28,6 +28,47 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
   })
   let busy = false
   let lastFailAt = 0
+  // #6：「有感而发」的由头要能跨进程/跨重启活下来，而且要有时效——
+  // 14:00「聊得难受」的由头不该被 22:00 的闲着日记拿去用；进程重启也不该丢。
+  // 存在 state.json 里（单槽，新事件覆盖旧事件），超过 6 小时自动作废。
+  const CUE_TTL_MS = 6 * 3600_000
+  function noteEvent(cue) {
+    const text = String(cue || '').trim().slice(0, 200)
+    if (!text) return
+    update((s) => { s.cue = { text, at: Date.now() }; return s.cue }).catch(() => {})
+  }
+  function freshCue(s) {
+    const c = s && s.cue
+    if (!c || !c.text) return ''
+    if (Date.now() - (Number(c.at) || 0) > CUE_TTL_MS) return ''
+    return String(c.text)
+  }
+
+  // #6：写日记的公共流程：认领过的「due」时间戳失败时要按 at 精确回滚，
+  // 不能用 pop()——那会删掉另一个进程刚认领的那条，把当天名额漏回去。
+  async function runDiary(trigger, at) {
+    let cue = ''
+    try { cue = freshCue(state()) } catch {}
+    let r = null
+    try {
+      r = await writeDiary({ cue })
+    } catch (error) {
+      log.warn('写日记抛错：' + (error?.message || error))
+      r = { ok: false }
+    }
+    if (r && r.ok) {
+      if (cue) { try { await update((s) => { s.cue = null }) } catch {} }
+      return true
+    }
+    lastFailAt = Date.now()
+    try {
+      await update((s) => {
+        const list = s.triggers && s.triggers[trigger]
+        if (Array.isArray(list)) s.triggers[trigger] = list.filter((t) => Number(t) !== Number(at))
+      })
+    } catch {}
+    return false
+  }
 
   async function post(content, { visibility } = {}) {
     const cfg = getConfig()
@@ -72,18 +113,23 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     return lines.join('\n')
   }
 
-  async function writeDiary({ visibility, force = false } = {}) {
+  async function writeDiary({ visibility, force = false, cue = '' } = {}) {
     if (busy && !force) return { ok: false, message: '上一篇还在写' }
     busy = true
+    // #6：cue 可以由调用方显式传入（噩梦），没传就用 state 里存的那条（6 小时内有效）。
+    if (!cue) { try { cue = freshCue(state()) } catch {} }
     try {
       const now = new Date()
       const excerpt = todayExcerpt()
+      // cue = 「有感而发」的由头（比如刚做的噩梦、忽然想起的一件小事），有它就不用等定时器。
+      const cueLine = String(cue || '').trim() ? `刚才发生的事（写这篇的由头，别照抄、用自己的话写）：\n${String(cue).trim().slice(0, 600)}` : ''
       const prompt = [
         `【写空间日记】现在是 ${now.getMonth() + 1} 月 ${now.getDate()} 日 ${now.toTimeString().slice(0, 5)}。`,
+        cueLine,
         excerpt ? `今天你在网页上的聊天片段（「我」是你自己）：\n${excerpt}` : '今天还没怎么聊天。',
         `请用你自己的口吻写一条记录（空间日记），第一人称，${DIARY_BUILTIN.minChars}~${DIARY_BUILTIN.maxChars} 个字，像真人随手写的记录：写今天真实发生的小事、此刻的心情或想法。`,
         '不要分条、不要 |||、不要 <voice>/<sticker> 标记、不要 Markdown、不要加引号，只输出记录正文本身。',
-      ].join('\n\n')
+      ].filter(Boolean).join('\n\n')
       let text = await hub.runSystemTurn('diary', '空间日记', prompt)
       text = String(text || '').replace(/\|\|\|/g, ' ').replace(/<[^>]+>/g, '').replace(/^["「“]|["」”]$/g, '').trim()
       if (text.length > DIARY_BUILTIN.maxChars + 20) text = text.slice(0, DIARY_BUILTIN.maxChars + 20)
@@ -110,12 +156,18 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     const nowMin = now.getHours() * 60 + now.getMinutes()
     const inWindow = nowMin >= toMin(DIARY_BUILTIN.quietFrom) && nowMin <= toMin(DIARY_BUILTIN.quietTo)
 
-    // 先锁内看今天的触发器计数（顺带重置跨天），再决定要不要写——双进程不会同时开写。
+    // #36：双进程抢写——不能「先看再写」（两边都看到 due、锁外各写一篇）。
+    // 锁内先认领：通过就把时间戳推进 triggers（占住这次名额），写失败再回滚。
     const gates = await update((s) => {
       if (!s.triggers || s.triggers.day !== today) s.triggers = { day: today, idle: [], event: [] }
       let dueIdle = false
       if (inWindow) {
-        const lastChat = Number(hub.lastOwnerChatAt) || 0
+        // #37：hub.lastOwnerChatAt 是进程内存，重启归零；用 life.lastSeenAt（落盘）兜底，
+        // 不然「主人 3 小时没说话」这个条件重启后永远不成立，日记触发器废掉。
+        const lastChat = Math.max(
+          Number(hub.lastOwnerChatAt) || 0,
+          Number(life?.load?.().life?.lastSeenAt) || 0,
+        )
         if (lastChat && Date.now() - lastChat >= DIARY_BUILTIN.idleAfterMinutes * 60_000 && s.triggers.idle.length < DIARY_BUILTIN.idleDailyMax) dueIdle = true
       }
       let dueEvent = false
@@ -132,23 +184,24 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
         } catch {}
         if (spike && s.triggers.event.length < DIARY_BUILTIN.eventDailyMax) dueEvent = true
       }
-      return { dueIdle, dueEvent }
+      // 另一个进程刚认领过（10 分钟内）→ 让位，避免双进程同一波各写一篇。
+      const recent = [...(s.triggers.idle || []), ...(s.triggers.event || [])].some((t) => Number.isFinite(Number(t)) && Date.now() - Number(t) < 10 * 60_000)
+      if (recent) return {}
+      if (dueIdle) { const at = Date.now(); s.triggers.idle.push(at); return { due: 'idle', at } }
+      if (dueEvent) { const at = Date.now(); s.triggers.event.push(at); return { due: 'event', at } }
+      return {}
     })
 
     // 触发器 2「闲着」：距最后一条主人消息 ≥3 小时（醒着时段内），每天最多 2 篇
-    if (gates.dueIdle) {
+    if (gates.due === 'idle') {
       log.info('闲着有一阵了，写一篇空间日记')
-      const r = await writeDiary()
-      if (r?.ok) await update((s) => { s.triggers.idle.push(Date.now()) })
-      else lastFailAt = Date.now()
+      await runDiary('idle', gates.at)
       return
     }
     // 触发器 3「有必要」：当天激素有大波动（情绪值得记），每天最多 2 篇
-    if (gates.dueEvent) {
+    if (gates.due === 'event') {
       log.info('今天情绪有大波动，写一篇空间日记')
-      const r = await writeDiary()
-      if (r?.ok) await update((s) => { s.triggers.event.push(Date.now()) })
-      else lastFailAt = Date.now()
+      await runDiary('event', gates.at)
     }
   }
 
@@ -219,6 +272,7 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     post,
     remove,
     writeDiary,
+    noteEvent,
     tick,
     history: () => state().history,
     visibleEntries,

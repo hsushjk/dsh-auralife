@@ -33,13 +33,15 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
     s.count++
   }
 
-  async function replyOwn(s, budget) {
-    let done = 0
+  // 把「这轮该回哪些留言」在锁内认领好：写 s.replied 的同时生成任务，立刻放锁。
+  // 认领和生成分开——模型调用可能几分钟，绝不能放在锁里（#40/#41）。
+  function collectTasks(s, budget) {
+    const tasks = []
     const entries = azone.state().history
     for (const e of entries) {
-      if (done >= budget) break
+      if (tasks.length >= budget) break
       for (const c of e.comments || []) {
-        if (done >= budget) break
+        if (tasks.length >= budget) break
         const thread = [c, ...(c.replies || [])].sort((a, b) => Number(a.at || 0) - Number(b.at || 0))
         let lastMine = -1
         thread.forEach((x, i) => { if (String(x.from) === SELF) lastMine = i })
@@ -49,39 +51,62 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
         const handled = new Set(s.replied[key] || [])
         const unhandled = pending.filter((x) => !handled.has(x.id))
         if (!unhandled.length) continue
-
-        for (const x of pending) handled.add(x.id)
+        for (const x of unhandled) handled.add(x.id)
         s.replied[key] = [...handled].slice(-100)
         const last = unhandled[unhandled.length - 1]
         const threadText = thread.map((x) => `${x.name || '某人'}：${String(x.text).slice(0, 120)}`).join('\n')
-        const text = await write(
-          `你在空间写过一条记录：「${String(e.text).slice(0, 200)}」\n` +
-          `这条记录下面大家的留言：\n${threadText}\n\n` +
-          `${last.name || '某人'} 刚刚说了新的话，结合记录内容和上面的留言，用你的口气接着回 TA 一句。`,
-        )
-        if (!text) continue
-        azone.addReply(e.id, c.id, { from: SELF, name: herName(), text })
-        // 旧 memory.addEvent 已随记忆 v2 退役（v2 只有 remember/revise/forget），改走 remember。
-        try {
-          memory?.remember?.({
-            text: `在空间回复了${last.name || '某人'}的留言：${String(text).slice(0, 80)}`,
-            about: String(last.from),
-            aboutName: String(last.name || ''),
-            conf: 0.35,
-            source: 'self_did',
-            tags: ['空间'],
-          })
-        } catch {}
-        record(s, { kind: 'reply', who: last.name, post: String(e.text).slice(0, 30), text })
-        emit?.('azone', { reason: 'reply', entryId: e.id })
-        done++
+        tasks.push({
+          key,
+          ids: unhandled.map((x) => x.id),
+          entryId: e.id,
+          commentId: c.id,
+          postText: String(e.text || ''),
+          last,
+          prompt:
+            `你在空间写过一条记录：「${String(e.text).slice(0, 200)}」\n` +
+            `这条记录下面大家的留言：\n${threadText}\n\n` +
+            `${last.name || '某人'} 刚刚说了新的话，结合记录内容和上面的留言，用你的口气接着回 TA 一句。`,
+        })
       }
     }
-
+    // 清理已经不存在（被删）的留言的认领记录，避免 replied 无限膨胀。
     const keep = new Set()
     for (const e of entries) for (const c of e.comments || []) keep.add(`${e.id}/${c.id}`)
     for (const k of Object.keys(s.replied)) if (!keep.has(k)) delete s.replied[k]
-    return done
+    return tasks
+  }
+
+  // 生成失败/空回复：把认领的 id 退回去，下一轮还会再试（#40）。
+  async function releaseClaims(task) {
+    try {
+      await withFileLock('azone-social', () => {
+        const s = load()
+        const cur = new Set(s.replied[task.key] || [])
+        for (const id of task.ids) cur.delete(id)
+        if (cur.size) s.replied[task.key] = [...cur].slice(-100)
+        else delete s.replied[task.key]
+        save(s)
+      }, { staleMs: 30000, timeoutMs: 10000 })
+    } catch (error) {
+      log.warn('退回空间认领失败：', error.message)
+    }
+  }
+
+  function commitTask(task, text, s) {
+    azone.addReply(task.entryId, task.commentId, { from: SELF, name: herName(), text })
+    // 旧 memory.addEvent 已随记忆 v2 退役（v2 只有 remember/revise/forget），改走 remember。
+    try {
+      memory?.remember?.({
+        text: `在空间回复了${task.last.name || '某人'}的留言：${String(text).slice(0, 80)}`,
+        about: String(task.last.from),
+        aboutName: String(task.last.name || ''),
+        conf: 0.35,
+        source: 'self_did',
+        tags: ['空间'],
+      })
+    } catch {}
+    record(s, { kind: 'reply', who: task.last.name, post: task.postText.slice(0, 30), text })
+    emit?.('azone', { reason: 'reply', entryId: task.entryId })
   }
 
   async function run({ force = false } = {}) {
@@ -91,24 +116,51 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
     if (!force && (!cfg.enabled || !c.enabled)) return { ok: false, message: '没打开' }
     busy = true
     try {
-      // 多进程锁：多进程心跳会同时进「每条新留言都回」→ 双回复。整段回复放锁里，
-      // 另一进程拿不到锁就跳过本轮。staleMs 放宽：单轮最多 3 条、每条要调 LLM，可能超过默认 15s。
-      return await withFileLock('azone-social', async () => {
-        const s = load()
-        if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), count: 0 })
-        s.lastRun = Date.now()
+      // 第一段（锁内）：只认领，不算模型。第二段（锁外）：逐条调模型。
+      // 第三段（锁内）：写回记录；失败/空回复退回认领（#40/#41）。
+      let tasks = []
+      try {
+        tasks = await withFileLock('azone-social', () => {
+          const s = load()
+          if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), count: 0 })
+          s.lastRun = Date.now()
+          const claimed = c.replyOwn === false ? [] : collectTasks(s, 3)
+          save(s)
+          return claimed
+        }, { staleMs: 30000, timeoutMs: 10000 })
+      } catch (error) {
+        log.warn('逛空间认领失败：', error.message)
+        return { ok: false, message: error.message }
+      }
+
+      let replies = 0
+      for (const task of tasks) {
+        let text = ''
         try {
-          // 无每日上限：每条新留言都回（去重），每轮最多 3 条防单轮过长。
-          const left = force ? 3 : 99
-          const replies = c.replyOwn ? await replyOwn(s, Math.min(3, left)) : 0
-          save(s)
-          return { ok: true, message: `回了 ${replies} 条留言`, replies }
+          text = await write(task.prompt)
         } catch (error) {
-          save(s)
-          log.warn('逛空间出错：', error.message)
-          return { ok: false, message: error.message }
+          log.warn('逛空间生成失败：', error.message)
+          await releaseClaims(task)
+          continue
         }
-      }, { staleMs: 240000 })
+        if (!text) {
+          await releaseClaims(task)
+          continue
+        }
+        try {
+          await withFileLock('azone-social', () => {
+            const s = load()
+            if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), count: 0 })
+            commitTask(task, text, s)
+            save(s)
+          }, { staleMs: 30000, timeoutMs: 10000 })
+          replies++
+        } catch (error) {
+          log.warn('逛空间写回失败：', error.message)
+          await releaseClaims(task)
+        }
+      }
+      return { ok: true, message: `回了 ${replies} 条留言`, replies }
     } finally {
       busy = false
     }

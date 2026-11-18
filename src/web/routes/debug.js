@@ -12,7 +12,7 @@
 //   identity: set（name/ownerName/body，模拟 Ta 改人格）/ reset（清空覆盖回出厂种子）
 //   alarm: set（at+reason）/ clear
 //   chat: prune（清聊天历史+重置会话）/ inject（注入假消息）
-import { dataDir } from '../../core/store.js'
+import { dataDir, withFileLock } from '../../core/store.js'
 import { join } from 'node:path'
 import { readdirSync, unlinkSync, rmSync } from 'node:fs'
 import { OWNER_ID } from '../../chat/access.js'
@@ -42,7 +42,10 @@ export function register(router, ctx) {
       if (mod === 'memory') {
         if (action === 'clear') {
           const before = memory.stats()
-          const files = memory.store.clear('facts') + memory.store.clear('episodes') + memory.store.clear('edges')
+          // #9：清空也要和 consolidate/replay 互斥；否则对方手里那批随后照写，清完立刻长回来一半。
+          const files = await withFileLock('memory-tick', () => (
+            memory.store.clear('facts') + memory.store.clear('episodes') + memory.store.clear('edges')
+          ), { staleMs: 15000, timeoutMs: 10000 })
           log.warn(`[debug] memory.clear：${JSON.stringify(before)} → 0（删 ${files} 个 jsonl）`)
           return done({ before, after: memory.stats() })
         }

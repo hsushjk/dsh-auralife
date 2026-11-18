@@ -203,7 +203,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
       seg.count = data.messages.length
       writeIndex(chatId, idx)
       return msg
-    }, { staleMs: 10000, timeoutMs: 5000 })
+    }, { staleMs: 10000, timeoutMs: 20000 })
   }
 
   function readSeg(chatId, id) {
@@ -223,7 +223,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
       Object.assign(last, patch)
       writeJson(segFile(chatId, seg.id), data)
       return last
-    }, { staleMs: 10000, timeoutMs: 5000 })
+    }, { staleMs: 10000, timeoutMs: 20000 })
   }
 
   function page(chatId, { before = 0, limit = SEGMENT_LIMIT } = {}) {
@@ -346,7 +346,9 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
 
   // 过期清理：整片比 keepDays 还旧就删掉（连带这片的媒体文件），
   // 再顺手扫一遍 media 目录里过期/没人要的文件。
-  function sweep(chatId) {
+  // 注意：sweep / splitCurrent / finalize / archiveChat 都会重写 index、删段文件，
+  // 必须和 append/patchLast 用同一把 `hist-<chatId>` 锁，否则会拿旧 index 覆盖新段 / 删掉刚写进去的消息。
+  function sweepLocked(chatId) {
     const days = keepDays()
     const cutoff = Date.now() - days * 86400_000
     const idx = readIndex(chatId)
@@ -402,12 +404,19 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return { changed: dropped > 0, dropped, orphans, oldestAt: oldestAt(chatId), hasMore: totalOf(chatId) > 0 }
   }
 
-  function sweepAll() {
+  const lockId = (chatId) => `hist-${chatId}`
+  const histLock = { staleMs: 10000, timeoutMs: 20000 }
+
+  function sweep(chatId) {
+    return withFileLock(lockId(chatId), () => sweepLocked(chatId), histLock)
+  }
+
+  async function sweepAll() {
     let names = []
     try { names = readdirSync(chatsRoot(), { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name) } catch {}
     const out = []
     for (const name of names) {
-      const r = sweep(name)
+      const r = await sweep(name)
       if (r.changed) out.push({ chatId: name, ...r })
     }
     // media 下还有聊天目录已经不在的，直接清掉
@@ -424,7 +433,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
 
   // 把「当前片」里超过 100 条的部分切成每片 100，最后一片留下当新的当前片。
   // 只在空闲时做：聊天途中完全不切，所以不会出现「聊到 101 条前面的忽然藏起来」。
-  function splitCurrent(chatId) {
+  function splitCurrentLocked(chatId) {
     const idx = readIndex(chatId)
     const last = idx.segments[idx.segments.length - 1]
     if (!last || (last.count || 0) <= SEGMENT_LIMIT) return null
@@ -447,29 +456,34 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return made
   }
 
-  // 空闲处理：先裁切，再清过期片，有删除就通知客户端新的边界
-  function finalize(chatId) {
+  const splitCurrent = (chatId) => withFileLock(lockId(chatId), () => splitCurrentLocked(chatId), histLock)
+
+  // 空闲处理：先裁切，再清过期片，有删除就通知客户端新的边界。
+  // 两个动作在同一把锁内完成，保证和 append 互斥；调用方需要 await / catch。
+  async function finalize(chatId) {
     timers.delete(chatId)
-    let split = null
-    try { split = splitCurrent(chatId) } catch (e) { log.warn?.('空闲裁切出错：' + e.message) }
-    const r = sweep(chatId)
-    if (r.changed) {
-      log.info?.(`聊天记录过期清理：${chatId} 删了 ${r.dropped} 条`)
-      emit('history', {
-        chatId,
-        oldestAt: r.oldestAt,
-        droppedBefore: r.oldestAt,
-        hasMore: totalOf(chatId) > SEGMENT_LIMIT,
-      })
-    }
-    return { ...r, split: split ? split.map((s) => s.count) : null }
+    return withFileLock(lockId(chatId), () => {
+      let split = null
+      try { split = splitCurrentLocked(chatId) } catch (e) { log.warn?.('空闲裁切出错：' + e.message) }
+      const r = sweepLocked(chatId)
+      if (r.changed) {
+        log.info?.(`聊天记录过期清理：${chatId} 删了 ${r.dropped} 条`)
+        emit('history', {
+          chatId,
+          oldestAt: r.oldestAt,
+          droppedBefore: r.oldestAt,
+          hasMore: totalOf(chatId) > SEGMENT_LIMIT,
+        })
+      }
+      return { ...r, split: split ? split.map((s) => s.count) : null }
+    }, histLock)
   }
 
   function touch(chatId) {
     const t = timers.get(chatId)
     if (t) clearTimeout(t)
     const timer = setTimeout(() => {
-      try { finalize(chatId) } catch (e) { log.warn?.('空闲裁切出错：' + e.message) }
+      Promise.resolve(finalize(chatId)).catch((e) => log.warn?.('空闲裁切出错：' + (e?.message || e)))
     }, IDLE_MS)
     if (typeof timer.unref === 'function') timer.unref()
     timers.set(chatId, timer)
@@ -499,7 +513,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
   // 上下文轮换用把该 chat 的全部 seg 原文挪进 archive-<时间戳>/ 子目录，
   // 再重置 index.json —— 之后 stats() 只数新会话的消息，老对话作为本地归档保留。
   // rebuildIndex 只扫 chatDir 一层（不过滤子目录，目录本身不会被 .json 过滤命中），归档不会被误收。
-  function archiveChat(chatId) {
+  function archiveChatLocked(chatId) {
     const idx = readIndex(chatId)
     if (!idx.segments.length) return 0
     const stamp = Date.now()
@@ -513,6 +527,8 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     try { writeJson(indexFile(chatId), emptyIndex(chatId)) } catch {}
     return moved
   }
+
+  const archiveChat = (chatId) => withFileLock(lockId(chatId), () => archiveChatLocked(chatId), histLock)
 
   return {
     append, patchLast, page, pageFile, recent, last, oldestAt, totalOf,

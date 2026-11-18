@@ -15,7 +15,7 @@ import { createReceipt } from './receipt.js'
 import { createEncode } from './encode.js'
 import { createReplay } from './replay.js'
 import { migrateLegacy } from './migrate.js'
-import { isDup, isHardFact } from './similar.js'
+import { isDup, isHardFact, normalizeText } from './similar.js'
 import { OWNER_ID } from '../chat/access.js'
 
 const SRC_MAP = { tool: 'manual', panel: 'manual', manual: 'manual', import: 'manual', auto: 'inferred', event: 'self_did', diary: 'self_did' }
@@ -23,7 +23,8 @@ const SRC_MAP = { tool: 'manual', panel: 'manual', manual: 'manual', import: 'ma
 // 记忆运行参数内置（DESIGN-modular.md §3）：召回条数 / 整理节奏归 Ta 自己，用户不可调。
 // consolidate 不再绑 04:00——改成距上次 ≥30 分钟增量整理（白天也长事件）；
 // replay（联想建边/遗忘/自我提炼）每天一次，也不再绑凌晨（主人从不通宵，事件和联想从来没长出来过）。
-const MEMORY_BUILTIN = { recallCount: 6, dailyConsolidate: true, consolidateGapMinutes: 30, replayAfterHour: 3 }
+// #21：不再是「整批记忆塞提示」——每轮只捞最相关的 4 条，外加偶尔一次「忽然想起」。
+const MEMORY_BUILTIN = { recallCount: 4, dailyConsolidate: true, consolidateGapMinutes: 30, replayAfterHour: 3 }
 
 export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self, chemistry }) {
   const store = createMemStore({ log })
@@ -87,6 +88,7 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
       const recent = (hub?.recentChat?.(chat?.chatId, 3) || []).map((m) => m.text).filter(Boolean)
       const r = recallModule.recall(q, {
         about,
+        chatId: chat?.chatId || '',
         mood: mv,
         cortisol: cv,
         recent,
@@ -102,63 +104,146 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
         chemistry?.event?.({ dopamine: 1 }, '想起了快忘掉的事')
       }
     }
+    // #21：偶尔（45 分钟内最多一次）在对话里「忽然想起」一件旧事——不是每轮都硬塞，
+    // 也不只在主动开口那条链路（drive）里才有想起的记忆。
+    if (chat?.chatId === OWNER_ID && !chat?.system) {
+      try {
+        const runs = loadRuns()
+        const now = Date.now()
+        if (now - (Number(runs.lastSpontaneousAt) || 0) > 45 * 60_000) {
+          const sp = recallModule.spontaneous(now, { chatId: OWNER_ID })
+          if (sp?.line) {
+            parts.push('（' + sp.line + '。这件旧事别特意提，想到就顺口带一句，想不起来就放着。）')
+            // #14b：这次真的注入了这一轮上下文，才算「想起来过」，再进 12 小时冷却。
+            if (typeof sp.mark === 'function') sp.mark().catch(() => {})
+            runs.lastSpontaneousAt = now
+            saveRuns(runs)
+          }
+        }
+      } catch {}
+    }
     return parts.join('\n')
   }
 
   // ---- 主链路 2：consolidate（编码新消息 → episode + fact）----
+  // LLM 不进锁（#46）：旧实现把 encodeSegment 放在 memory-tick 锁里，模型一挂
+  // 整个记忆整理就永久卡死。现在拆三段：锁内认领 → 锁外调模型 → 锁内推进水位。
   let busy = false
-  function consolidate({ includeToday = true, force = false } = {}) {
+  const CLAIM_TTL_MS = 10 * 60_000
+  const CONSOLIDATE_LOCK = { staleMs: 15000, timeoutMs: 10000 }
+
+  function consolidate() {
     if (busy) return Promise.resolve({ ok: false, message: '正在整理中' })
     busy = true
-    // 锁进公共入口（审计：tick 与调试台都能调 consolidate，跨进程只允许一个在整理）。
-    return withFileLock('memory-tick', async () => {
+    return consolidateRun().finally(() => { busy = false })
+  }
+
+  async function consolidateRun() {
+    let jobs = []
     try {
-      const wm = loadWatermark()
-      let added = 0
-      let superseded = 0
-      let episodes = 0
-      const factIds = []
+      jobs = await withFileLock('memory-tick', () => {
+        const runs = loadRuns()
+        const claims = Object.fromEntries(
+          Object.entries(runs.consolidateClaims || {})
+            .filter(([, x]) => x && Date.now() - Number(x.at || 0) < CLAIM_TTL_MS),
+        )
+        const wm = loadWatermark()
+        const out = []
+        for (const chatId of listChatIds()) {
+          if (String(chatId).startsWith('system')) continue
+          if (claims[chatId]) continue
+          let msgs = []
+          try {
+            const page = hub?.pageOf?.(chatId, { limit: 200 })
+            msgs = (Array.isArray(page) ? page : (page?.messages || [])).slice().reverse()
+          } catch { continue }
+          if (!msgs.length) continue
+          const since = Number(wm[chatId]) || 0
+          const fresh = msgs.filter((m) => (m.t || 0) > since && m.text && !String(m.text).startsWith('【系统'))
+          if (!fresh.length) continue
+          claims[chatId] = { at: Date.now(), upto: Math.max(since, ...fresh.map((m) => m.t)) }
+          out.push({ chatId, since, fresh: fresh.map((m) => ({ id: m.id, t: m.t, who: m.who, uid: m.uid, text: m.text })) })
+        }
+        runs.consolidateClaims = claims
+        saveRuns(runs)
+        return out
+      }, CONSOLIDATE_LOCK)
+    } catch (error) {
+      log.warn('记忆编码认领失败：', error.message)
+      return { ok: false, message: error.message }
+    }
 
-      for (const chatId of listChatIds()) {
-        if (String(chatId).startsWith('system')) continue
-        // pageOf 返回 { messages: [...] }（history.page 形状），不是数组——真凶：
-        // 旧代码把对象当数组 .slice() 抛错被 catch 吞掉，每个会话都被跳过，事件永远 0。
-        let msgs = []
-        try {
-          const page = hub?.pageOf?.(chatId, { limit: 200 })
-          msgs = (Array.isArray(page) ? page : (page?.messages || [])).slice().reverse()
-        } catch { continue }
-        if (!msgs.length) continue
-        const since = Number(wm[chatId]) || 0
-        const fresh = msgs.filter((m) => (m.t || 0) > since && m.text && !String(m.text).startsWith('【系统'))
-        // 原来 ≥3 条才编码，聊 1-2 句就停时最后几条会滞留到下次再聊。
-        // 改成只要有新鲜消息就编码（30min 节流保证不会高频烧 LLM），尾巴不再滞留。
-        if (!fresh.length) continue
+    if (!jobs.length) {
+      const last = loadRuns().lastConsolidate || null
+      return last
+        ? { ok: true, added: 0, superseded: 0, episodes: 0, receipt: last.receipt || 'found', last }
+        : { ok: true, added: 0, superseded: 0, episodes: 0, receipt: 'found' }
+    }
 
+    let added = 0
+    let superseded = 0
+    let episodes = 0
+    const factIds = []
+    for (const job of jobs) {
+      try {
         const names = { [OWNER_ID]: getConfig().ownerName || '主人' }
-        const res = await encode.encodeSegment(chatId, fresh.map((m) => ({ id: m.id, t: m.t, who: m.who, uid: m.uid, text: m.text })), { names })
+        const res = await encode.encodeSegment(job.chatId, job.fresh, { names })
         added += res.facts.added
         superseded += res.facts.superseded
         episodes += res.episodes.length
         factIds.push(...(res.facts.addedIds || []), ...(res.facts.supersededIds || []))
-        wm[chatId] = Math.max(since, ...fresh.map((m) => m.t))
+        await withFileLock('memory-tick', () => {
+          const wm = loadWatermark()
+          wm[job.chatId] = Math.max(Number(wm[job.chatId]) || 0, ...job.fresh.map((m) => m.t))
+          saveWatermark(wm)
+          const runs = loadRuns()
+          if (runs.consolidateClaims) delete runs.consolidateClaims[job.chatId]
+          saveRuns(runs)
+        }, CONSOLIDATE_LOCK)
+      } catch (error) {
+        log.warn(`记忆编码（${job.chatId}）失败：`, error.message)
+        try {
+          await withFileLock('memory-tick', () => {
+            const runs = loadRuns()
+            if (runs.consolidateClaims) delete runs.consolidateClaims[job.chatId]
+            saveRuns(runs)
+          }, CONSOLIDATE_LOCK)
+        } catch {}
       }
-      saveWatermark(wm)
+    }
 
-      // 写完读回：按 id 逐条核对（三态 found/missing/unknown）
-      const verify = receipt.verifyFacts(factIds)
-      const state = factIds.length ? (verify.missing.length ? 'missing' : 'found') : 'found'
-
+    // #2（结构性）：历史里正则猜出来的 kind 定期交给模型批量纠正，别让「猜」一直留着。
+    // 每 24 小时最多一轮，最多 20 条（模型调用在 memory-tick 锁外）。
+    try {
       const runs = loadRuns()
-      runs.lastConsolidate = { day: dayKey(), at: Date.now(), added, superseded, episodes, receipt: state }
-      saveRuns(runs)
-
-      log.info(`记忆编码：新增 ${added} 条、更新 ${superseded} 条、事件 ${episodes} 段，回执 ${state}`)
-      return { ok: true, added, superseded, episodes, receipt: { state, found: verify.found.length, missing: verify.missing.length } }
+      if (Date.now() - (Number(runs.lastKindFixAt) || 0) > 24 * 3600_000) {
+        const fixed = await encode.fixKinds({ limit: 20 })
+        await withFileLock('memory-tick', () => {
+          const r2 = loadRuns()
+          r2.lastKindFixAt = Date.now()
+          if (fixed > 0) r2.lastKindFixed = Number(r2.lastKindFixed || 0) + fixed
+          saveRuns(r2)
+        }, CONSOLIDATE_LOCK)
+        if (fixed > 0) log.info(`记忆类型纠正：${fixed} 条`)
+      }
     } catch (error) {
-      log.warn('记忆编码失败：', error.message)
-      return { ok: false, message: error.message }
-    } }, { staleMs: 300000 }).finally(() => { busy = false }) // 编码调 LLM 可能几分钟，锁超龄放宽
+      log.warn('记忆类型纠正失败：' + (error?.message || error))
+    }
+
+    const verify = receipt.verifyFacts(factIds)
+    const state = factIds.length ? (verify.missing.length ? 'missing' : 'found') : 'found'
+    try {
+      await withFileLock('memory-tick', () => {
+        const runs = loadRuns()
+        runs.lastConsolidate = { day: dayKey(), at: Date.now(), added, superseded, episodes, receipt: state }
+        saveRuns(runs)
+      }, CONSOLIDATE_LOCK)
+    } catch (error) {
+      log.warn('记忆编码收尾失败：', error.message)
+    }
+
+    log.info(`记忆编码：新增 ${added} 条、更新 ${superseded} 条、事件 ${episodes} 段，回执 ${state}`)
+    return { ok: true, added, superseded, episodes, receipt: { state, found: verify.found.length, missing: verify.missing.length } }
   }
 
   // ---- 主链路 3：tick（调度：consolidate 增量 + replay 每天一次）----
@@ -185,8 +270,13 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
     if (now.getHours() >= MEMORY_BUILTIN.replayAfterHour && runs.lastReplay?.day !== today) {
       try {
         const replayReport = await replay.run({ now: Date.now() })
-        runs.lastReplay = { day: today, at: Date.now(), edges: replayReport.edgesAdded, forgotten: replayReport.forgotten }
-        saveRuns(runs)
+        // #7：replay 跑几十秒，期间别的进程可能已经改了 runs.json（consolidate 记录、claim、lastKindFixAt）。
+        // 用旧快照整份 save 会把这些全盖掉——锁内重新读，只合并 lastReplay 一个字段。
+        await withFileLock('memory-tick', () => {
+          const fresh = loadRuns()
+          fresh.lastReplay = { day: today, at: Date.now(), edges: replayReport.edgesAdded, forgotten: replayReport.forgotten }
+          saveRuns(fresh)
+        }, { staleMs: 15000, timeoutMs: 10000 })
       } catch (error) { log.warn('重放失败：', error.message) }
     }
 
@@ -216,8 +306,20 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
     const src = SRC_MAP[source] || 'inferred'
     const c = clamp(conf)
     const subj = String(about || '')
-    const dup = store.currentFacts().find((f) => isDup({ text: t, subj }, f))
+    // 判重范围跟 chatId 对齐（#18）：客人的话不能并进主人的事实；chatId 为空 = 全局共享。
+    const scope = String(chatId || '')
+    const dup = store.currentFacts().find((f) => {
+      const fc = String(f.chatId || '')
+      return (fc === scope || fc === '' || scope === '') && isDup({ text: t, subj }, f)
+    })
     if (dup) {
+      // 新说法更具体 → supersede 合并，别只 bumpHit 把细节丢掉（复查 #9）。
+      const oldText = String(dup.text || '')
+      if (t.length > oldText.length + 4 && normalizeText(t) !== normalizeText(oldText)) {
+        store.supersede(dup.id, { text: t, subj: subj || dup.subj, aboutName: String(aboutName || dup.aboutName || ''), src, conf: c, chatId: dup.chatId || String(chatId || ''), tags: (tags || []).slice(0, 5), archived: isHardFact({ text: t, src, conf: c }) })
+          .catch((error) => log.warn('记忆合并失败：' + (error?.message || error)))
+        return { ok: true, message: '✓', id: dup.id, updated: true, fact: { ...dup, text: t } }
+      }
       store.bumpHit(dup.id).catch((error) => log.warn('记忆命中计数写失败：' + (error?.message || error)))
       return { ok: true, message: '✓', id: dup.id, updated: true, fact: store.findFact(dup.id) }
     }
@@ -245,8 +347,42 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
   }
 
   // 召回：直接返回 v2 结果（lines 已格式化，candidates 是原始命中）。
-  function recall(query, { about = '', limit, mood, recent } = {}) {
-    return recallModule.recall(String(query || ''), { about, mood: mood ?? null, recent: recent || [], now: Date.now(), limit })
+  function recall(query, { about = '', limit, mood, recent, chatId = '' } = {}) {
+    return recallModule.recall(String(query || ''), { about, mood: mood ?? null, recent: recent || [], now: Date.now(), limit, chatId: String(chatId || '') })
+  }
+
+  // 落一条梦（#24 梦的落库）：梦不是事实，只写 episode（kind='dream'），
+  // 再把素材 id ↔ 梦 id 连成 kind='dreamed' 的联想边——以后 recall 到那条旧事时，
+  // assocExpand 会带出「我梦见过这件事」，这是梦进入人格的唯一通道。
+  function recordDream({ title = '', mood = 'weird', text = '', about = '', materials = [], stage = '', at = Date.now() } = {}) {
+    const body = String(text || '').trim().slice(0, 600)
+    if (!body) return { ok: false }
+    const ids = (Array.isArray(materials) ? materials : []).filter((x) => typeof x === 'string' && x).slice(0, 8)
+    const ep = store.addEpisode({
+      t0: at,
+      t1: at,
+      chatId: '',
+      people: about ? [String(about).slice(0, 40)] : [],
+      moodIn: null,
+      moodOut: null,
+      summary: `${String(title || '').slice(0, 40)}${title ? '：' : ''}${body}`,
+      tags: ['dream', String(mood || 'weird')].filter(Boolean),
+      salience: mood === 'bad' ? 0.75 : 0.65,
+      kind: 'dream',
+      title: String(title || '').slice(0, 40),
+      mood: String(mood || 'weird').slice(0, 20),
+      materials: ids,
+      stage: String(stage || '').slice(0, 10),
+    })
+    // 建边要幂等（用 mid|ep|dreamed 做去重键）：多进程/重试都只连一次。
+    const existing = new Set(store.edges().map((e) => `${e.a}|${e.b}|${e.kind}`))
+    for (const mid of ids) {
+      const key = `${mid}|${ep.id}|dreamed`
+      if (existing.has(key)) continue
+      existing.add(key)
+      store.addEdge({ a: mid, b: ep.id, kind: 'dreamed', w: 1, why: 'dream', at })
+    }
+    return { ok: true, episode: ep }
   }
 
   function facts() { return store.facts() }
@@ -258,6 +394,11 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
   return {
     contextFor, tick, consolidate, extractDiary,
     remember, revise, forget, recall, facts, episodes, edges, stats, lastConsolidate,
+    // 梦落库（#24）：episode + dreamed 边，不写 facts。
+    recordDream,
+    // 忽然想起（#17）：给 drive 的主动开口/梦提供素材，而不是每轮把记忆整批塞提示。
+    // opts = { chatId }：单聊里不想起别的会话的事。
+    spontaneous: (now = Date.now(), opts = {}) => recallModule.spontaneous(now, opts),
     // 内部（host.js 装配用 / 面板自证用）
     store, recallModule, encode, replay, receipt,
     migrate: () => migrateLegacy({ store, log }),

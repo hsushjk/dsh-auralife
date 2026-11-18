@@ -13,6 +13,8 @@ export const DEFAULT_TAGS = ['开心', '卖萌', '生气', '委屈', '无语', '
 
 // 表情库上限内置（DESIGN-modular.md §3）。
 const LIBRARY_MAX = 300
+// 索引读-改-写统一用这把锁：双进程同时收图/改图时后写会覆盖先写，索引丢图（#42）。
+const LOCK_OPTS = { staleMs: 10000, timeoutMs: 10000 }
 
 export function loadLibrary() {
   return readJson(indexFile(), () => ({ items: [] }))
@@ -95,32 +97,40 @@ export function createStickerStore({ dsh, getConfig, log }) {
 
   async function addFromBuffer(buf, { name = '', tags = [], from = 'manual', hint = '' } = {}) {
     const md5 = createHash('md5').update(buf).digest('hex')
-    const lib = loadLibrary()
-    const exist = lib.items.find((i) => i.md5 === md5)
-    if (exist) return { ok: true, item: exist, existed: true }
+    const existed = loadLibrary().items.find((i) => i.md5 === md5)
+    if (existed) return { ok: true, item: existed, existed: true }
     const mime = mimeOf(buf)
     if (!mime.startsWith('image/')) return { ok: false, reason: '不是图片' }
     const { width, height } = imageSize(buf)
-    mkdirSync(dir(), { recursive: true })
-    const file = `manual-${md5}.${ext(mime)}`
-    writeFileSync(join(dir(), file), buf)
-    const item = { md5, file, name: String(name).slice(0, 12), tags, from, at: Date.now(), width, height, bytes: buf.length }
-    lib.items.push(item)
-    saveLibrary(lib)
+    const item = { md5, file: `manual-${md5}.${ext(mime)}`, name: String(name).slice(0, 12), tags, from, at: Date.now(), width, height, bytes: buf.length }
+    // 判重 + 写文件 + push + save 必须在同一把锁里，否则双进程并发收图会各写各的索引（#42）。
+    const added = await withFileLock('sticker-lib', () => {
+      const lib = loadLibrary()
+      const exist = lib.items.find((i) => i.md5 === md5)
+      if (exist) return { existed: true, item: exist }
+      mkdirSync(dir(), { recursive: true })
+      writeFileSync(join(dir(), item.file), buf)
+      lib.items.push(item)
+      saveLibrary(lib)
+      return { existed: false, item }
+    }, LOCK_OPTS)
+    if (added.existed) return { ok: true, item: added.item, existed: true }
     log.info(`收了一张表情 ${md5.slice(0, 8)}（${width}x${height}）`)
     await trim()
     if (getConfig().stickers.caption && !item.name) {
-      caption(buf, mime, hint).then(async ({ name, tags }) => {
-        const l = loadLibrary()
-        const it = l.items.find((i) => i.md5 === md5)
-        if (!it) return
-        if (!it.name) it.name = name || hint || '表情'
-        it.tags = tags.length ? tags : it.tags
-        saveLibrary(l)
-        log.info(`表情 ${md5.slice(0, 8)} 起名「${it.name}」${it.tags.length ? ' #' + it.tags.join(' #') : ''}`)
+      caption(buf, mime, hint).then(async ({ name: capName, tags: capTags }) => {
+        await withFileLock('sticker-lib', () => {
+          const l = loadLibrary()
+          const it = l.items.find((i) => i.md5 === md5)
+          if (!it) return
+          if (!it.name) it.name = capName || hint || '表情'
+          it.tags = capTags.length ? capTags : it.tags
+          saveLibrary(l)
+          log.info(`表情 ${md5.slice(0, 8)} 起名「${it.name}」${it.tags.length ? ' #' + it.tags.join(' #') : ''}`)
+        }, LOCK_OPTS)
       }).catch((error) => log.warn('表情起名收尾出错：', error.message))
     }
-    return { ok: true, item }
+    return { ok: true, item, existed: false }
   }
 
   async function trim() {
@@ -148,23 +158,27 @@ export function createStickerStore({ dsh, getConfig, log }) {
   }
 
   async function remove(md5) {
-    const lib = loadLibrary()
-    const it = lib.items.find((i) => i.md5 === md5)
-    if (!it) return { ok: false, reason: '没有这张' }
-    try { unlinkSync(join(dir(), it.file)) } catch (error) {}
-    lib.items = lib.items.filter((i) => i.md5 !== md5)
-    saveLibrary(lib)
-    return { ok: true }
+    return withFileLock('sticker-lib', () => {
+      const lib = loadLibrary()
+      const it = lib.items.find((i) => i.md5 === md5)
+      if (!it) return { ok: false, reason: '没有这张' }
+      try { unlinkSync(join(dir(), it.file)) } catch (error) {}
+      lib.items = lib.items.filter((i) => i.md5 !== md5)
+      saveLibrary(lib)
+      return { ok: true }
+    }, LOCK_OPTS)
   }
 
   function rename(md5, name, tags) {
-    const lib = loadLibrary()
-    const it = lib.items.find((i) => i.md5 === md5)
-    if (!it) return { ok: false }
-    if (name !== undefined) it.name = String(name).slice(0, 12)
-    if (tags !== undefined) it.tags = tags
-    saveLibrary(lib)
-    return { ok: true, item: it }
+    return withFileLock('sticker-lib', () => {
+      const lib = loadLibrary()
+      const it = lib.items.find((i) => i.md5 === md5)
+      if (!it) return { ok: false }
+      if (name !== undefined) it.name = String(name).slice(0, 12)
+      if (tags !== undefined) it.tags = tags
+      saveLibrary(lib)
+      return { ok: true, item: it }
+    }, LOCK_OPTS)
   }
 
   function resolve(tagOrName) {

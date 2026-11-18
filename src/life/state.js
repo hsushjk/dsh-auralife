@@ -24,8 +24,16 @@ export function defaultState(now = Date.now()) {
     identity: { name: '', ownerName: '', body: '' },
     // 她自己的作息（睡眠静默期）：默认 02:00-07:00，Ta 可以根据作息自己改（tools.js web_set_rhythm）。
     rhythm: { quietFrom: '02:00', quietTo: '07:00' },
+    // 睡眠是硬状态（#18）：awake | sleeping | drowsy（被叫醒后「暂时醒着」）| dream_wake。
+    // 以前 inQuiet 只是参考值，睡没睡完全由 AI 自己发挥，于是「睡着也能开口」。
+    sleep: { state: 'awake', since: now, sleepStart: 0, wakeUntil: 0, attempts: 0, lastAttemptAt: 0, lastDreamAt: 0, dreamed: { one: false, two: false }, dreamClaims: {}, dreamSlot: '', dreamAt: 0, lastKind: '', lastActivityAt: 0, dreamCore: null },
+    // 梦（#24）：每个睡眠周期最多一次；在睡眠 1/3、2/3 两个窗口里随机挑一个做（窗内再随机抖动），
+    // 第一次窗口没做成会顺延到第二次窗口；产出写进记忆/联想，噩梦会把她吓醒。
+    dream: { lastAt: 0, lastKind: '', count: 0, title: '', mood: '', episodeId: '' },
   }
 }
+
+const SLEEP_STATES = new Set(['awake', 'sleeping', 'drowsy', 'dream_wake'])
 
 // 宽松合并：旧/缺字段回退默认，不抛错，保证 schema 向前兼容。
 export function normalizeState(raw, now = Date.now()) {
@@ -43,7 +51,7 @@ export function normalizeState(raw, now = Date.now()) {
     identity: {
       name: s.identity && typeof s.identity.name === 'string' ? s.identity.name.slice(0, 20) : '',
       ownerName: s.identity && typeof s.identity.ownerName === 'string' ? s.identity.ownerName.slice(0,20) : '',
-      body: s.identity && typeof s.identity.body === 'string' ? s.identity.body : '',
+      body: s.identity && typeof s.identity.body === 'string' ? s.identity.body.slice(0, 1200) : '',
       updatedAt: Number(s.identity && s.identity.updatedAt) || 0,
     },
     rhythm: (() => {
@@ -52,6 +60,53 @@ export function normalizeState(raw, now = Date.now()) {
       const from = ok.test(String(r.quietFrom || '')) ? r.quietFrom : d.rhythm.quietFrom
       const to = ok.test(String(r.quietTo || '')) ? r.quietTo : d.rhythm.quietTo
       return { quietFrom: from, quietTo: to }
+    })(),
+    sleep: (() => {
+      const raw = s.sleep && typeof s.sleep === 'object' ? s.sleep : {}
+      const num = (v, def) => (Number.isFinite(Number(v)) ? Number(v) : def)
+      const dreamed = raw.dreamed && typeof raw.dreamed === 'object' ? raw.dreamed : {}
+      const rawClaims = raw.dreamClaims && typeof raw.dreamClaims === 'object' ? raw.dreamClaims : {}
+      const claims = {}
+      for (const stage of ['one', 'two']) {
+        const at = Number(rawClaims[stage])
+        if (Number.isFinite(at) && at > 0) claims[stage] = at
+      }
+      return {
+        state: SLEEP_STATES.has(String(raw.state)) ? String(raw.state) : d.sleep.state,
+        since: num(raw.since, d.sleep.since),
+        sleepStart: num(raw.sleepStart, 0),
+        wakeUntil: num(raw.wakeUntil, 0),
+        attempts: num(raw.attempts, 0),
+        lastAttemptAt: num(raw.lastAttemptAt, 0),
+        lastDreamAt: num(raw.lastDreamAt, 0),
+        dreamed: { one: !!dreamed.one, two: !!dreamed.two },
+        dreamClaims: claims,
+        dreamSlot: ['', 'none', 'one', 'two'].includes(String(raw.dreamSlot)) ? String(raw.dreamSlot) : '',
+        dreamAt: num(raw.dreamAt, 0),
+        lastKind: typeof raw.lastKind === 'string' ? raw.lastKind.slice(0, 20) : '',
+        lastActivityAt: num(raw.lastActivityAt, 0),
+        // 梦核：认领梦的那一刻在锁里抽好的素材（id + 描述行），跨进程/跨 tick 复用，避免两次抽到不同素材。
+        dreamCore: (() => {
+          const c = raw.dreamCore && typeof raw.dreamCore === 'object' ? raw.dreamCore : null
+          if (!c) return null
+          const ids = Array.isArray(c.ids) ? c.ids.filter((x) => typeof x === 'string' && x).slice(0, 8) : []
+          const lines = Array.isArray(c.lines) ? c.lines.filter((x) => typeof x === 'string' && x).slice(0, 6) : []
+          if (!ids.length && !lines.length) return null
+          return { at: num(c.at, 0), ids, lines }
+        })(),
+      }
+    })(),
+    dream: (() => {
+      const raw = s.dream && typeof s.dream === 'object' ? s.dream : {}
+      const num = (v, def) => (Number.isFinite(Number(v)) ? Number(v) : def)
+      return {
+        lastAt: num(raw.lastAt, 0),
+        lastKind: typeof raw.lastKind === 'string' ? raw.lastKind.slice(0, 20) : '',
+        count: num(raw.count, 0),
+        title: typeof raw.title === 'string' ? raw.title.slice(0, 40) : '',
+        mood: typeof raw.mood === 'string' ? raw.mood.slice(0, 20) : '',
+        episodeId: typeof raw.episodeId === 'string' ? raw.episodeId.slice(0, 40) : '',
+      }
     })(),
   }
 }
@@ -170,7 +225,8 @@ export function createLife({ getConfig, log }) {
       const id = s.identity || { name: '', ownerName: '', body: '', updatedAt: 0 }
       if (typeof patch.name === 'string') id.name = patch.name.slice(0, 20)
       if (typeof patch.ownerName === 'string') id.ownerName = patch.ownerName.slice(0, 20)
-      if (typeof patch.body === 'string') id.body = patch.body
+      // #18：body 是进系统提示的，必须限长——写嗨了一次占掉一大截上下文，而且永久留存。
+      if (typeof patch.body === 'string') id.body = patch.body.slice(0, 1200)
       id.updatedAt = Date.now() // Ta 上次改人格的时间（面板要显示）
       s.identity = id
       return id

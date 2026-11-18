@@ -1,12 +1,35 @@
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, statSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync, readdirSync, unlinkSync, writeFileSync, renameSync } from 'node:fs'
+import { readdir, stat, unlink, utimes } from 'node:fs/promises'
 import { buildWav, toMono16k } from './wav.js'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { dataDir } from '../core/store.js'
 
 export const PYENV_DIR = process.env.AURALIFE_PYENV || join(homedir(), 'AuraLife', 'pyenv')
+
+// 语音缓存保留 30 天：同样的文字+音色不重复合成（#45）。
+const CACHE_TTL_MS = 30 * 86400_000
+
+// #9：清扫是同步 readdir+stat，缓存上千文件会卡事件循环。改成后台异步、每小时最多一次。
+let lastCleanupAt = 0
+async function cleanupDir(d) {
+  let names = []
+  try { names = await readdir(d) } catch { return }
+  for (const n of names) {
+    const p = join(d, n)
+    try {
+      const s = await stat(p)
+      if (Date.now() - s.mtimeMs > CACHE_TTL_MS) await unlink(p)
+    } catch { /* 文件可能刚被删/正在用 */ }
+  }
+}
+
+// 命中缓存时刷一下 mtime：常说的句子不该在 30 天后被当过期清掉（#9）。
+function touchCache(file) {
+  try { utimes(file, new Date(), new Date()).catch(() => {}) } catch { /* 忽略 */ }
+}
 // Linux 兼容：Windows 的 venv 是 Scripts/python.exe，Linux 是 bin/python。
 const pyExe = () => join(PYENV_DIR, process.platform === 'win32' ? join('Scripts', 'python.exe') : join('bin', 'python'))
 
@@ -42,13 +65,56 @@ function outDir() {
   const d = dataDir('voice-cache')
   mkdirSync(d, { recursive: true })
 
-  try {
-    for (const n of readdirSync(d)) {
-      const p = join(d, n)
-      if (Date.now() - statSync(p).mtimeMs > 86400_000) unlinkSync(p)
-    }
-  } catch (error) {}
+  // 异步清扫、每小时最多一次（#9）：热路径上不再同步 readdir+stat 整个目录。
+  if (Date.now() - lastCleanupAt > 3600_000) {
+    lastCleanupAt = Date.now()
+    cleanupDir(d).catch(() => {})
+  }
   return d
+}
+
+// ---- 语音缓存（#45）：按「文字 + 合成参数」的 hash 命名，命中就直接复用 ----
+function cacheKeyOf(text, opt = {}) {
+  return createHash('sha1').update(JSON.stringify({
+    text,
+    provider: opt.provider || 'auto',
+    engine: opt.engine || 'auto',
+    voice: opt.voice || '',
+    rate: opt.rate || '',
+    pitch: opt.pitch || '',
+    ttsBaseUrl: opt.ttsBaseUrl || '',
+    ttsModel: opt.ttsModel || '',
+    ttsVoice: opt.ttsVoice || '',
+    rvc: opt.rvc || null,
+  })).digest('hex').slice(0, 20)
+}
+
+function findCached(key) {
+  const d = outDir()
+  for (const extName of ['mp3', 'wav', 'ogg']) {
+    const p = join(d, `${key}.${extName}`)
+    try {
+      if (existsSync(p) && statSync(p).size > 0) {
+        touchCache(p)
+        return p
+      }
+    } catch (error) {}
+  }
+  return ''
+}
+
+// 合成结果以 cacheKey 落盘；rename 失败（跨盘/权限）就保留原文件，不影响这次播放。
+function keepAsCache(file, key) {
+  if (!file) return file
+  try {
+    const ext = (String(file).match(/\.([a-z0-9]+)$/i) || ['.mp3'])[0]
+    const target = join(outDir(), `${key}${ext}`)
+    if (file === target) return target
+    renameSync(file, target)
+    return target
+  } catch (error) {
+    return file
+  }
 }
 
 export function edgeInstalled() {
@@ -245,6 +311,10 @@ export const voiceConverters = []
 export async function textToSpeech(text, opt = {}, log) {
   const clean = String(text || '').trim()
   if (!clean) throw new Error('没有要念的文字')
+  // 同一句话同一个音色只合成一次（#45）。
+  const cacheKey = cacheKeyOf(clean, opt)
+  const cached = findCached(cacheKey)
+  if (cached) return { file: cached, engine: 'cache' }
   let file = ''
   let engine = ''
   const provider = opt.provider || 'auto'
@@ -290,6 +360,7 @@ export async function textToSpeech(text, opt = {}, log) {
       log?.warn('变声失败，用原声：', error.message)
     }
   }
+  file = keepAsCache(file, cacheKey)
   return { file, engine }
 }
 

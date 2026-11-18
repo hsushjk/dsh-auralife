@@ -70,8 +70,9 @@ export function createWishes({ getConfig, life, log }) {
     return life.load().wishes
   }
 
+  // #32：只从「open」里挑最挂念的；已了结的心愿不该再被当成开口的由头。
   function top(now = Date.now()) {
-    const ws = list()
+    const ws = list().filter((w) => w && w.status === 'open')
     let best = null
     let bestT = -1
     for (const w of ws) {
@@ -81,8 +82,23 @@ export function createWishes({ getConfig, life, log }) {
     return best ? { ...best, tension: bestT } : null
   }
 
+  // 判重用的归一化文本：标点/空格/大小写不算区别。
+  function norm(text) {
+    return String(text || '').toLowerCase().replace(/[\s，。！？、；：""''（）()【】\[\]，.!?;:]/g, '')
+  }
+
+  // #34：带来源地种执念（chatId 只作为来源标签；同一句已有 open 的就不重复种）。
   function add(text, opts = {}) {
-    return life.addWish(text, { baseTension: 30, tensionRate: 4, ...opts })
+    const t = String(text || '').trim().slice(0, 200)
+    if (!t) return Promise.resolve(null)
+    const key = norm(t)
+    return life.update((s) => {
+      if ((s.wishes || []).some((w) => w && w.status === 'open' && norm(w.text) === key)) return null
+      const w = makeWish(t, { baseTension: 30, tensionRate: 4, ...opts })
+      if (opts.chatId) w.chatId = String(opts.chatId)
+      s.wishes.push(w)
+      return w
+    })
   }
 
   function resolve(id, closedBy = '') {
@@ -93,5 +109,35 @@ export function createWishes({ getConfig, life, log }) {
     return life.bumpWish(id, by)
   }
 
-  return { migrateFromMemo, list, top, add, resolve, bump, memoFile }
+  // #33：真拿它开口/去做过之后，要大幅抵掉张力；张力归零或放置超过 3 天就自然结束，
+  // 不再像以前那样只 +1 relief、张力钉在 100 上永远关不掉。
+  function fulfill(id, now = Date.now()) {
+    return life.update((s) => {
+      const w = (s.wishes || []).find((x) => x && x.id === id && x.status === 'open')
+      if (!w) return null
+      w.relief = (Number(w.relief) || 0) + 40
+      w.lastUsedAt = now
+      const ageMs = now - (Number(w.createdAt) || now)
+      if (wishTension(w, now) <= 0 || ageMs > 3 * 86400_000) {
+        w.status = 'closed'
+        w.closedBy = '自己去做过了'
+      }
+      return { id: w.id, status: w.status, tension: wishTension(w, now) }
+    })
+  }
+
+  // 池子空了（都自然结束了）就过一阵补种一条日常挂念，不然 pressure 再没有源头。
+  function ensureOpen(now = Date.now()) {
+    return life.update((s) => {
+      const ws = s.wishes || []
+      if (ws.some((w) => w && w.status === 'open')) return false
+      const last = ws.reduce((m, w) => Math.max(m, Number(w.createdAt) || 0), 0)
+      if (last && now - last < 6 * 3600_000) return false
+      const idea = DEFAULT_WISHES[Math.floor(Math.random() * DEFAULT_WISHES.length)]
+      s.wishes.push(makeWish(idea.text, idea))
+      return true
+    })
+  }
+
+  return { migrateFromMemo, list, top, add, resolve, bump, fulfill, ensureOpen, memoFile }
 }

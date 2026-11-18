@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, statSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { VERSION } from '../core/version.js'
@@ -83,6 +84,19 @@ function stripDataUrl(s) {
 
 export function createWebServer({ dsh, getConfig, setConfig, publicConfig, log, getConfigForRoutes }) {
   const clients = new Set()
+
+  // #12：SSE 的 token 不该出现在 URL（会进访问日志/Referer/浏览器历史）。
+  // 改成一次性、60 秒有效的 ticket：先 POST /api/stream-ticket（带 Bearer），再拿去开 EventSource。
+  const streamTickets = new Map()
+  function pruneTickets(now = Date.now()) {
+    for (const [k, v] of streamTickets) if (now - v.at > 60_000) streamTickets.delete(k)
+  }
+  function issueStreamTicket(me) {
+    pruneTickets()
+    const ticket = randomUUID()
+    streamTickets.set(ticket, { subject: me.subject, role: me.role, level: me.level, at: Date.now() })
+    return ticket
+  }
   const router = createRouter()
   let boundDeps = null
 
@@ -114,6 +128,7 @@ export function createWebServer({ dsh, getConfig, setConfig, publicConfig, log, 
       json, send, readBody, tokenOf, stripDataUrl, chatIdOf, requireUser, requireOwner,
       dsh, getConfig, setConfig, publicConfig, log, VERSION, MIME, ROOT,
       listModels: deps.listModels || (async () => null),
+      issueStreamTicket: (me) => issueStreamTicket(me),
       listPersonas,
       needSetup, setupOwner, verify, issueSession, sessionUser, dropSession,
       ownerInfo, listGuests, createGuest, updateGuest, deleteGuest, displayNameOf, changePassword,
@@ -159,7 +174,16 @@ export function createWebServer({ dsh, getConfig, setConfig, publicConfig, log, 
   }
 
   function handleStream(req, res, url) {
-    const me = sessionUser(url.searchParams.get('token'))
+    // #12：优先用一次性 ticket；兼容旧页面还带 token 的情况。
+    let me = null
+    const ticket = url.searchParams.get('ticket')
+    if (ticket) {
+      const rec = streamTickets.get(ticket)
+      streamTickets.delete(ticket)
+      if (rec && Date.now() - rec.at <= 60_000) me = { subject: rec.subject, role: rec.role, level: rec.level }
+    } else {
+      me = sessionUser(url.searchParams.get('token'))
+    }
     if (!me) return send(res, 401, { ok: false, reason: '没登录' })
     const chatId = chatIdOf(me.subject)
     res.writeHead(200, {

@@ -835,9 +835,18 @@ function showFileConfirm(items, totalRaw, totalB64) {
   ov.addEventListener('click', (e2) => { if (e2.target === ov) ov.remove() })
 }
 
-function connectStream() {
+async function connectStream() {
   if (stream) stream.close()
-  stream = new EventSource(BASE + '/api/stream?token=' + encodeURIComponent(token))
+  // #12：token 不进 URL。先换一张一次性 ticket，再开 EventSource；换不到才退回旧参数（兼容旧服务端）。
+  let url = BASE + '/api/stream'
+  try {
+    const r = await api('/api/stream-ticket', { method: 'POST', body: {} })
+    if (r && r.ok && r.ticket) url += '?ticket=' + encodeURIComponent(r.ticket)
+    else url += '?token=' + encodeURIComponent(token)
+  } catch (err) {
+    url += '?token=' + encodeURIComponent(token)
+  }
+  stream = new EventSource(url)
   stream.onmessage = (e) => {
     let ev
     try { ev = JSON.parse(e.data) } catch (err) { return }
@@ -1999,8 +2008,15 @@ async function loadGuests() {
   if (create) create.onclick = async () => {
     const username = ($('#g-u')?.value || '').trim()
     if (!username) return toast('先填个用户名', 'err')
-    const r2 = await api('/api/guests', { method: 'POST', body: { username, displayName: ($('#g-d')?.value || '').trim() || username, level: $('#g-level')?.value || 'social' } })
+    // 默认只聊天；完全权限是建好之后主人手动点开的白名单（#44）。
+    const wantLevel = $('#g-level')?.value || 'social'
+    if (wantLevel === 'full' && !confirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？（也可以先建好，再单独点开）')) return
+    const r2 = await api('/api/guests', { method: 'POST', body: { username, displayName: ($('#g-d')?.value || '').trim() || username, level: 'social' } })
     if (r2.ok) {
+      if (wantLevel === 'full') {
+        const r3 = await api('/api/guests/' + r2.subject, { method: 'PATCH', body: { level: 'full', confirm: true } })
+        if (!r3.ok) toast('客人建好了，但完全权限没开成：' + (r3.reason || ''), 'err')
+      }
       toast('创建好了，一次性密码：' + r2.password)
       if (navigator.clipboard) navigator.clipboard.writeText(r2.password).catch(() => {})
       if ($('#g-u')) $('#g-u').value = ''
@@ -2036,8 +2052,11 @@ async function loadGuests() {
   box.onchange = async (e) => {
     const sel = e.target.closest('[data-glevel]')
     if (!sel) return
-    const r2 = await api('/api/guests/' + sel.dataset.glevel, { method: 'PATCH', body: { level: sel.value } })
+    // 完全权限要二次确认；取消就恢复原值（#44）。
+    if (sel.value === 'full' && !confirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？')) { sel.value = 'social'; return }
+    const r2 = await api('/api/guests/' + sel.dataset.glevel, { method: 'PATCH', body: { level: sel.value, confirm: true } })
     toast(r2.ok ? '改好了' : (r2.reason || '没改成'), r2.ok ? '' : 'err')
+    if (!r2.ok) loadGuests()
   }
 }
 

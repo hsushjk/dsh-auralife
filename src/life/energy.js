@@ -39,33 +39,55 @@ export function createEnergy({ life, getConfig, log }) {
     return inRange(new Date(now), r.quietFrom, r.quietTo)
   }
 
+  // 纯计算：把血条恢复到 now（不落盘），浮点值。rhythm 由调用方传入（锁内用 st.rhythm）。
+  function recovered(raw, now, rhythm) {
+    const r = rhythm || {}
+    const quiet = inRange(new Date(now), r.quietFrom, r.quietTo)
+    const elapsedMin = Math.max(0, (now - raw.at) / 60_000)
+    const rate = quiet ? ENERGY_BUILTIN.recoverAsleepPerMinute : ENERGY_BUILTIN.recoverPerMinute
+    return { version: 1, at: now, level: clamp(raw.level + elapsedMin * rate, 0, 100) }
+  }
+
   // 纯读：血条恢复到 now（不落盘），浮点值。
   function peek(now = Date.now()) {
-    const e = load()
-    const elapsedMin = Math.max(0, (now - e.at) / 60_000)
-    const rate = asleep(now) ? ENERGY_BUILTIN.recoverAsleepPerMinute : ENERGY_BUILTIN.recoverPerMinute
-    const level = clamp(e.level + elapsedMin * rate, 0, 100)
-    return { version: 1, at: now, level }
+    return recovered(load(), now, life.load().rhythm)
   }
 
-  // 落盘恢复结果（60s 心跳用）。
+  // 落盘恢复结果（60s 心跳用）。读-算-写整体进锁：锁外 peek 再整块写回会抹掉别的进程刚扣的血。
   async function tick(now = Date.now()) {
-    const next = peek(now)
-    await save(next)
-    return next
-  }
-
-  // 消耗：每次模型请求 −costPerRequest。读-算-写整体进锁（审计：spend 的读在锁外，跨进程增量会被抹掉）。
-  function spend(now = Date.now()) {
     return life.update((st) => {
-      const raw = normalizeEnergy(st.energy)
-      const elapsedMin = Math.max(0, (now - raw.at) / 60_000)
-      const rate = asleep(now) ? ENERGY_BUILTIN.recoverAsleepPerMinute : ENERGY_BUILTIN.recoverPerMinute
-      const level = clamp(clamp(raw.level + elapsedMin * rate, 0, 100) - ENERGY_BUILTIN.costPerRequest, 0, 100)
-      const next = { version: 1, at: now, level }
+      const next = recovered(normalizeEnergy(st.energy), now, st.rhythm)
       st.energy = next
       return next
     })
+  }
+
+  // 消耗：每次模型请求 −costPerRequest。读-算-写整体进锁。
+  function spend(now = Date.now()) {
+    return life.update((st) => {
+      const raw = normalizeEnergy(st.energy)
+      const base = recovered(raw, now, st.rhythm)
+      const next = { version: 1, at: now, level: clamp(base.level - ENERGY_BUILTIN.costPerRequest, 0, 100) }
+      st.energy = next
+      return next
+    })
+  }
+
+  // 行为闸（#21/#49：体力不能只是装饰）：体力要真的 gate 行为——
+  // 累了不主动开口、更容易已读不回、回复更慢；空了只剩「我累了」；精神好时更主动、更少装死。
+  function gate(now = Date.now()) {
+    const level = peek(now).level
+    const high = level >= 80
+    return {
+      level,
+      high,
+      proactive: level >= 15,
+      sudden: level >= 30,
+      readIgnoreChance: level < 15 ? 0.35 : level < 25 ? 0.22 : level < 40 ? 0.08 : level < 60 ? 0.03 : high ? 0.005 : 0.01,
+      replyDelayMs: level < 15 ? 2500 : level < 35 ? 1000 : 0,
+      wakeAcceptChance: level < 25 ? 0.5 : level < 45 ? 0.7 : 0.9, // 太困时被叫醒更不容易完全醒过来
+      suddenBonus: high ? 0.04 : 0, // 体力满时更容易冒「忽然想起」的念头（#49）
+    }
   }
 
   const state = peek
@@ -76,8 +98,10 @@ export function createEnergy({ life, getConfig, log }) {
     if (e.level <= 10) return '[身体状态] 你此刻累得厉害，只能勉强回一句，说话都费劲。这些不用说出来，从语气里自然透出来。'
     if (e.level < 30) return '[身体状态] 你此刻挺累的，句子要短，不想主动开新话题。这些不用说出来，从语气里自然透出来。'
     if (e.level < 55) return '[身体状态] 你此刻有点乏，话别太长。这些不用说出来，从语气里自然透出来。'
-    return ''
+    // 高体力也显式给一行：体力恢复后，最新一次上下文快照会明确覆盖掉之前「累得厉害」的旧描述，
+    // 否则这一行直接消失时，模型容易引用历史里还在的旧快照，出现「体力已经恢复、提示里还说自己累」。
+    return '[身体状态] 你此刻精神不错，身体已经缓过来了，语气按平时的来就好。这些不用说出来，从语气里自然透出来。'
   }
 
-  return { load, tick, peek, spend, state: peek, contextLine }
+  return { load, tick, peek, spend, gate, state: peek, contextLine }
 }

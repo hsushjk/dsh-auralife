@@ -8,6 +8,7 @@ export function register(router, ctx) {
     getConfig, setConfig, log, dsh, listModels,
     needSetup, setupOwner, verify, issueSession, sessionUser, dropSession,
     listGuests, createGuest, updateGuest, deleteGuest, displayNameOf, changePassword,
+    issueStreamTicket,
   } = ctx
 
   router.add('GET', 'api/state', async (req, res) => {
@@ -112,12 +113,12 @@ export function register(router, ctx) {
     const b = await readBody(req)
     const acc = verify(b.username, b.password)
     if (!acc) return json(res, { ok: false, reason: '用户名或密码不正确' })
-    const token = issueSession(acc)
+    const token = await issueSession(acc)
     return json(res, { ok: true, token, subject: acc.subject, role: acc.role, name: displayNameOf(acc.subject) })
   })
 
   router.add('POST', 'api/logout', async (req, res) => {
-    dropSession(ctx.tokenOf(req))
+    await dropSession(ctx.tokenOf(req))
     return json(res, { ok: true })
   })
 
@@ -132,6 +133,14 @@ export function register(router, ctx) {
     return json(res, { ok: true, guests: listGuests() })
   })
 
+  router.add('POST', 'api/stream-ticket', async (req, res) => {
+    const me = requireUser(req, res); if (!me) return
+    // #12：ticket 一次性、60 秒有效，开 EventSource 用；token 不再走 URL。
+    const ticket = issueStreamTicket(me)
+    if (!ticket) return json(res, { ok: false, reason: '拿不到票据' })
+    return json(res, { ok: true, ticket })
+  })
+
   router.add('POST', 'api/guests', async (req, res) => {
     const me = requireOwner(req, res); if (!me) return
     const b = await readBody(req)
@@ -142,7 +151,7 @@ export function register(router, ctx) {
     const me = requireOwner(req, res); if (!me) return
     const subject = decodeURIComponent(p.slice('api/guests/'.length))
     const b = await readBody(req)
-    return json(res, updateGuest(subject, b))
+    return json(res, await updateGuest(subject, b))
   })
 
   router.prefix('DELETE', 'api/guests/', async (req, res, url, p) => {

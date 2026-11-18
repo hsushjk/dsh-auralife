@@ -29,15 +29,21 @@ export function register(router, ctx) {
     if (!me) return send(res, 401, { ok: false, reason: '没登录' })
     const id = decodeURIComponent(p.slice('api/media/'.length)).split('/')[0]
     if (!id) return send(res, 404, { ok: false, reason: '没有这个媒体' })
+    // 只允许安全文件名，防止 ../ 之类跳出媒体目录。
+    if (!/^[A-Za-z0-9._-]+$/.test(id) || id.includes('..')) return send(res, 404, { ok: false, reason: '没有这个媒体' })
     let file = mediaFileOf(ctx.chatIdOf(me.subject), id)
     if (!file || !existsSync(file)) {
-      // Ta 画的图可能落在别的会话目录（她通过工具在后台会话里画，消息被推到主人的会话）
+      // Ta 画的图可能落在别的会话目录（她通过工具在后台会话里画，消息被推到主人的会话）。
+      // 只给主人开这个兜底：客人不能靠 id 猜到自己会话以外的文件。
+      if (me.subject !== 'owner') return send(res, 404, { ok: false, reason: '这个媒体已经过期了' })
       const mediaDir = dataDir('media')
       file = null
-      for (const d of readdirSync(mediaDir).map((x) => join(mediaDir, x))) {
-        if (!statSync(d).isDirectory()) continue
-        const f = join(d, id)
-        if (existsSync(f)) { file = f; break }
+      if (existsSync(mediaDir)) {
+        for (const d of readdirSync(mediaDir).map((x) => join(mediaDir, x))) {
+          if (!statSync(d).isDirectory()) continue
+          const f = join(d, id)
+          if (existsSync(f)) { file = f; break }
+        }
       }
     }
     if (!file || !existsSync(file)) return send(res, 404, { ok: false, reason: '这个媒体已经过期了' })
@@ -86,14 +92,14 @@ export function register(router, ctx) {
   router.prefix('DELETE', 'api/stickers/', async (req, res, url, p) => {
     const me = requireOwner(req, res); if (!me) return
     const md5 = decodeURIComponent(p.slice('api/stickers/'.length))
-    return json(res, stickers.remove(md5))
+    return json(res, await stickers.remove(md5))
   })
 
   router.prefix('PATCH', 'api/stickers/', async (req, res, url, p) => {
     const me = requireOwner(req, res); if (!me) return
     const md5 = decodeURIComponent(p.slice('api/stickers/'.length))
     const b = await readBody(req)
-    return json(res, stickers.rename(md5, b.name, b.tags))
+    return json(res, await stickers.rename(md5, b.name, b.tags))
   })
 
   router.add('GET', 'api/icon', async (req, res) => {

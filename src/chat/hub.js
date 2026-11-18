@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
 import { parseReply, bubbleDelay } from './reply.js'
-import { levelFor, presetFor, isOwner, OWNER_ID } from './access.js'
+import { levelFor, presetForChat, isOwner, OWNER_ID } from './access.js'
 import { fetchImage } from '../core/net.js'
 import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
@@ -24,9 +24,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const sessionKey = (id) => String(id || '').replace(/^session-/, '')
 
 export function createHub({
-  dsh, getConfig, log, stickers, tts, buildTools, contextProviders,
-  onActivity, isMuted, moodEffects, emit, getModelPreference,
+  dsh, getConfig, log, stickers, tts, buildTools, contextProviders, dynamicContext,
+  onActivity, isMuted, moodEffects, emit, getModelPreference, sleep, energy,
 }) {
+  // sleep/energy 在 host 里创建顺序靠后：用 getter 延迟取，避免循环依赖。
+  const sleepOf = () => (typeof sleep === 'function' ? sleep() : sleep)
+  const energyOf = () => (typeof energy === 'function' ? energy() : energy)
   const chatlogDir = () => dataDir('chatlog')
   const sessionsFile = () => dataDir('sessions.json')
   const history = createHistory({
@@ -52,19 +55,69 @@ export function createHub({
   let liveWindow = 0 // DSH 平台真实窗口：session/event 里 request/context 事件带 contextWindow（如 1M）
   let liveModel = ''
 
-  let stats = { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, errors: 0 }
+  // #17：stats 要落盘，不然面板的 turns/messages/voice 一重启就归零。写盘做 2 秒防抖。
+  const statsFile = () => dataDir('stats.json')
+  let stats = (() => {
+    try {
+      const saved = readJson(statsFile(), () => null)
+      if (saved && typeof saved === 'object') {
+        return { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0, ...saved }
+      }
+    } catch {}
+    return { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0 }
+  })()
+  let statsTimer = null
+  function persistStatsSoon() {
+    if (statsTimer) return
+    statsTimer = setTimeout(() => {
+      statsTimer = null
+      try {
+        writeJson(statsFile(), stats)?.catch?.((error) => log.warn('统计落盘失败：' + (error?.message || error)))
+      } catch (error) {
+        log.warn('统计落盘失败：' + (error?.message || error))
+      }
+    }, 2000)
+    statsTimer.unref?.()
+  }
   let lastChatAt = 0
   let lastOwnerChatAt = 0
   let lastBotToOwner = null
+  // 已读不回（#19）：看到但此刻不想/不能回的消息先记着；drive 过几分钟来补一句。
+  // #47：以前只活在这个进程的内存里——drive 跑在另一个进程/重启后就再也补不上。
+  // 现在落盘到 data/pending-reply.json，跨进程读；认领时用锁 + claimedAt 防两个进程各补一遍。
+  let pendingReply = null
+  const pendingFile = () => dataDir('pending-reply.json')
+  function persistPendingReply(p) {
+    pendingReply = p || null
+    try {
+      writeJson(pendingFile(), p || null)?.catch?.((error) => log.warn('未回消息落盘失败：' + (error?.message || error)))
+    } catch (error) {
+      log.warn('未回消息落盘失败：' + (error?.message || error))
+    }
+  }
 
-  const bump = (k) => { stats[k] = (stats[k] || 0) + 1 }
+  const bump = (k) => { stats[k] = (stats[k] || 0) + 1; persistStatsSoon() }
   const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
 
   // 多进程下每个进程都跑一份插件，sessions.json 的读写要进锁，防互相覆盖丢会话映射。
   // 读路径不再进锁：writeJson 走「暂存文件 + rename」原子替换，读到的永远是完整 JSON；
   // 锁只串行化写，避免异步锁把同步读接口（sessions()）也拖成 Promise。
   function map() { return readJson(sessionsFile(), () => ({ chats: {} })) }
-  async function saveMap(m) { await withFileLock('sessions', () => writeJson(sessionsFile(), m), { staleMs: 5000, timeoutMs: 4000 }) }
+  // 读-改-写必须在同一把锁里完成：先读盘 → 改一条 → 整份写回。
+  // 以前是「锁外读快照、只锁写」，两个进程同时开新会话时后写的那个会用旧快照覆盖掉前一个，
+  // 映射一丢就落到重建会话。所有写入口都必须 await 这个函数。
+  function updateMap(mutator, opts = {}) {
+    return withFileLock('sessions', () => {
+      const m = readJson(sessionsFile(), () => ({ chats: {} }))
+      if (!m || typeof m !== 'object') throw new Error('sessions.json 内容异常')
+      if (!m.chats || typeof m.chats !== 'object') m.chats = {}
+      const out = mutator(m)
+      writeJson(sessionsFile(), m)
+      return out
+    }, { staleMs: 5000, timeoutMs: Number(opts.timeoutMs) || 8000 })
+  }
+  // 兼容旧调用：整体替换 chats（确认场景用；正常路径用 updateMap）
+  async function saveMap(m) { await updateMap((disk) => { disk.chats = (m && m.chats) || {} }) }
 
   // —— 上下文兜底估算用量，接近上限就把旧会话归档、开新会话 ——
   // 窗口优先级手动配置 chat.contextWindow > DSH 平台事件带出的 liveWindow
@@ -109,7 +162,7 @@ export function createHub({
     if (u.tokens < u.window * ROTATE_RATIO) return false
     const prior = map().chats[chat.chatId]
     const archiveDir = 'archive-' + Date.now()
-    history.archiveChat(chat.chatId)
+    await history.archiveChat(chat.chatId)
     const rec = {
       at: Date.now(),
       chatId: chat.chatId,
@@ -158,7 +211,13 @@ export function createHub({
   }
 
   async function appendMessage(chatId, payload) {
-    const msg = await history.append(chatId, payload)
+    let msg = null
+    try {
+      msg = await history.append(chatId, payload)
+    } catch (error) {
+      // sweep/splitCurrent 拿着历史锁搬大目录时，append 可能等到超时——不能让消息直接丢。
+      log.warn(`${chatId} 历史写入失败：` + (error?.message || error))
+    }
     emit?.('message', { chatId, message: msg })
     history.touch(chatId)
     return msg
@@ -212,7 +271,7 @@ export function createHub({
 
   async function createSession(chat, level) {
     const ws = await ensureWorkspace()
-    const preset = presetFor(level)
+    const preset = presetForChat(getConfig(), chat)
     const r = await controller().create({ workspaceId: ws.id, agentPreset: preset })
     const sid = String(r.sessionId)
     await controller().rename({ sessionId: sid, title: titleFor(chat) })
@@ -229,14 +288,36 @@ export function createHub({
   // 会话还在不在宿主的 SessionStore 里。缓存的 agent/session 对已被删掉的会话依然能 resolve 出对象，
   // 直到 followup/flush 时才炸（cannot append outside a SessionStore）。所以每次用之前先验活。
   // 老宿主没有 sessions 服务时返回 true，保持原有行为。
-  function sessionAlive(sid) {
+  async function sessionAlive(sid) {
     const store = dsh.sessions || dsh.get('sessions')
-    if (!store || typeof store.get !== 'function') return true
     const key = sessionKey(sid)
-    for (const id of [sid, key, 'session-' + key]) {
-      try { if (store.get(id)) return true } catch { /* 试下一个写法 */ }
+    if (store && typeof store.get === 'function') {
+      for (const id of [sid, key, 'session-' + key]) {
+        try { if (store.get(id)) return true } catch { /* 试下一个写法 */ }
+      }
     }
-    return false
+    // 内存里没挂载不算「已删」：DSH 重启后磁盘上的老会话还没 attach 到本进程。
+    // 真正存在性以持久化层为准（stat 返回 undefined/抛「找不到」才算不存在）；
+    // 没有这个服务时返回 true，保持原有行为，避免误判导致不停重建会话。
+    const persistence = (() => { try { return dsh.get('sessionPersistence') } catch { return null } })()
+    if (persistence && typeof persistence.stat === 'function') {
+      try {
+        const st = await persistence.stat(sid)
+        return st !== undefined && st !== null
+      } catch (error) {
+        const msg = String(error?.message || error || '')
+        if (/not.?found|不存在|ENOENT/i.test(msg)) return false
+        return true // 查询本身失败：别当成「已删」去重建
+      }
+    }
+    const query = (() => { try { return dsh.get('sessionQuery') } catch { return null } })()
+    if (query && typeof query.observeSession === 'function') {
+      try { await query.observeSession(sid); return true } catch (error) {
+        if (/NOT_FOUND|not.?found|不存在/i.test(String(error?.code || error?.message || ''))) return false
+        return true
+      }
+    }
+    return true
   }
 
   // 模型选择优先级：她自己挑的（state.json.model）> 主人配的（config.model）。
@@ -306,35 +387,64 @@ export function createHub({
   async function agentFor(chat) {
     const cfg = getConfig()
     const level = chat.system ? 'social' : levelFor(cfg, chat)
-    const preset = presetFor(level)
+    const preset = presetForChat(cfg, chat)
     const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
-    const m = map()
-    let entry = m.chats[chat.chatId]
-    let needNew = !entry || !entry.sessionId || entry.preset !== preset || entry.level !== level
+    let entry = map().chats[chat.chatId]
+    // #10：改权限不该重置会话——level 只是聊天档位（工具是否给全靠 isOwner），
+    // 真正影响会话的是 preset；档位变了就原地更新，不换 sessionId、不清上下文。
+    if (entry && entry.level !== level) {
+      entry.level = level
+      try {
+        await updateMap((m) => {
+          if (m.chats[chat.chatId]?.sessionId === entry.sessionId) m.chats[chat.chatId] = entry
+        })
+      } catch {}
+    }
+    let needNew = !entry || !entry.sessionId || entry.preset !== preset
     if (entry && entry.sessionId && (reg?.archivedSessionIds || []).includes(entry.sessionId)) needNew = true
-    // 会话被宿主删了（SessionStore 里没了）也算失效：否则会一直拿死会话重试，日记/自驱全部报错。
-    if (!needNew && entry?.sessionId && !sessionAlive(entry.sessionId)) {
-      log.warn(`会话 ${entry.sessionId} 已不在 SessionStore，重建会话`)
+    // 会话被宿主删了（SessionStore/持久化层里没了）也算失效：否则会一直拿死会话重试，日记/自驱全部报错。
+    if (!needNew && entry?.sessionId && !(await sessionAlive(entry.sessionId))) {
+      log.warn(`会话 ${entry.sessionId} 已不存在，重建会话`)
       needNew = true
     }
     if (needNew) {
       entry = await createSession(chat, level)
-      m.chats[chat.chatId] = entry
-      await saveMap(m)
+      await updateMap((m) => { m.chats[chat.chatId] = entry })
     }
     let agent = null
-    try { agent = await resolveAgent(entry.sessionId) } catch (e) { agent = null }
+    try {
+      agent = await resolveAgent(entry.sessionId)
+    } catch (e) {
+      // #11：宿主抖一下（模型报错、锁超时）不等于会话没了；先确认它还活着再决定，别当场失忆。
+      if (await sessionAlive(entry.sessionId).catch(() => false)) {
+        try {
+          await new Promise((r) => setTimeout(r, 250))
+          agent = await resolveAgent(entry.sessionId)
+        } catch (e2) {
+          log.warn(`会话 ${entry.sessionId} 重试解析失败：${e2?.message || e2}`)
+          agent = null
+        }
+      } else {
+        agent = null
+      }
+    }
     if (!agent) {
       entry = await createSession(chat, level)
-      m.chats[chat.chatId] = entry
-      await saveMap(m)
+      await updateMap((m) => { m.chats[chat.chatId] = entry })
       agent = await resolveAgent(entry.sessionId)
     }
+    // 模型选择真正做到「变了才切、切完才写」：正常每轮 0 次 sessions 锁，
+    // 换模型 1 次，新建会话 2 次（创建 + 模型）。以前每轮固定 3 次整份写，锁超时会直接打断回复。
     const mk = modelKey()
-    if (entry.modelKey && entry.modelKey !== mk) await applyModel(agent)
-    entry.modelKey = mk
-    m.chats[chat.chatId] = entry
-    await saveMap(m)
+    if (entry.modelKey !== mk) {
+      await applyModel(agent)
+      entry.modelKey = mk
+      await updateMap((m) => {
+        const cur = m.chats[chat.chatId]
+        if (cur && cur.sessionId === entry.sessionId) m.chats[chat.chatId] = entry
+        else if (!cur) m.chats[chat.chatId] = entry
+      })
+    }
     sessionToChat.set(sessionKey(entry.sessionId), chat.chatId)
     mount(agent, chat, level)
     return agent
@@ -395,15 +505,28 @@ export function createHub({
       const fileName = String(name || 'message.txt').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || 'message.txt'
       const saved = history.saveMedia(chatId, Buffer.from(text, 'utf8').toString('base64'), 'text/plain')
       await appendMessage(chatId, { who: 'bot', text: '[文件] ' + fileName, kind: 'file', fileName, fileMime: 'text/plain', mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes: saved.bytes, mark: 'ai-file' })
-      bump('images')
+      bump('files')
       return true
     } catch (e) { log.warn('文件发不出去：' + e.message); return false }
+  }
+
+  // 半醒窗口（drowsy/dream_wake）里又聊了一句 → 只记一笔「最近还有往来」，
+  // 回睡交给 sleep.tick：最后一次往来之后再过 10 分钟才收窗口（#27）。
+  // 沉默、空回复也算聊过（否则她只输出 [沉默] 时窗口会一直挂着）。
+  async function wakeWindowDone() {
+    try {
+      const s = sleepOf()
+      const ph = s?.phase?.()
+      if (ph === 'drowsy' || ph === 'dream_wake') await s.afterReply?.()
+    } catch (error) {
+      log.warn('记录活跃时间失败：' + (error?.message || error))
+    }
   }
 
   async function deliver(chatId, text, opts = {}) {
     const cfg = getConfig()
     const r = parseReply(text)
-    if (r.silent) { log.info(`${chatId}：Ta 选择不说话`); return }
+    if (r.silent) { log.info(`${chatId}：Ta 选择不说话`); await wakeWindowDone(); return }
     let items = r.items
     if (opts.wantVoice && cfg.voice.enabled && !items.some((i) => i.kind === 'voice')) {
       const spoken = items.filter((i) => i.kind === 'text').map((i) => i.value).join('，')
@@ -427,6 +550,8 @@ export function createHub({
     if (ownerChat) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
     // 附带 userId/level：宿主侧靠它区分「主人会话」和「客人会话」（器官自举只允许主人触发）。
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '', userId: ownerChat ? OWNER_ID : chatId, level: ownerChat ? 'full' : 'social' })
+    // 被叫醒后的「暂时醒着」：聊完这一轮自动回睡（#25）。
+    await wakeWindowDone()
   }
 
   async function deliverTo(target, text) {
@@ -462,20 +587,24 @@ export function createHub({
       const completed = d.reason && d.reason.kind === 'completed'
       const text = st.lastTurn === d.turn ? st.text : ''
       const sys = st.system
+      const sysTimedOut = Boolean(st.systemTimedOut)
       const wantVoice = Boolean(st.wantVoice)
       const lastText = st.lastText || ''
       if (st.sysTimer) { clearTimeout(st.sysTimer); st.sysTimer = null }
       st.text = ''
       st.senders = new Set()
       st.system = null
+      st.systemTimedOut = false
       st.wantVoice = false
+      // 超时的那一轮晚到的 turn/end：system 已被超时回调清空，直接丢弃，不能走正常发货分支。
+      if (sysTimedOut) { log.debug?.(`${chatId}：超时轮次晚到的 turn/end 已忽略`); return }
       if (sys) {
         if (completed) sys.resolve(text)
         else sys.reject(new Error('这一轮没正常结束：' + (d.reason?.kind || '?')))
         return
       }
       if (!completed) { log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}），不发`); release(chatId); return }
-      if (!text) return release(chatId)
+      if (!text) { wakeWindowDone().catch(() => {}); return release(chatId) }
       deliver(chatId, text, { wantVoice, userText: lastText }).catch((e) => log.warn('发送出错：' + e.message)).finally(() => release(chatId))
     }
   }
@@ -565,7 +694,7 @@ export function createHub({
       const bytes = saved ? saved.bytes : raw.length
       await appendMessage(chatId, { who: 'user', uid: userId, text: '[文件] ' + name, kind: 'file', fileName: name, fileMime: mime, ...(saved ? { mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes } : {}) })
       logChat(chatId, nickname || userId, '[文件] ' + name, userId)
-      bump('images')
+      bump('files')
       // 文本类文件：读出内容给 Ta 看（cap 4000 字）；二进制：只告知收到
       let txt = null
       if (/^text\//.test(mime) || /\.(txt|md|markdown|json|csv|log|js|ts|jsx|tsx|py|sh|bat|ini|yml|yaml|xml|html|css|sql|toml|conf|java|c|cpp|h|rs|go)$/i.test(name)) {
@@ -577,15 +706,102 @@ export function createHub({
         : `【对方发来一个文件「${name}」（${fmtB(bytes)}），我看不了里面的内容，只能先记下文件名】` })
     }
     bump('messages')
+    // 睡着时被找（#25）：第一句不搭理，第二句（10 分钟内）才懵懂回一句；
+    // 不想回的消息先记着，过几分钟 drive 会来补（#19）。
+    try {
+      const inbound = (await sleepOf()?.noteInbound?.(Date.now(), { chatId, level })) || null
+      if (inbound?.action === 'ignore') {
+        bump('read_no_reply')
+        // #5：只有主人在睡着时被找才值得补；客人的消息没有 catchup 会认领它，
+        // 落盘只会把上一条还没补的主人消息挤掉——别记，直接算了。
+        if (chatId === OWNER_ID) {
+          pendingReply = { chatId, at: Date.now(), text: text || (voice ? '[语音]' : sticker ? '[表情]' : '[消息]'), userId, level }
+          persistPendingReply(pendingReply)
+        }
+        log.info(`${chatId}：她睡着了，这条先不搭理`)
+        return
+      }
+      if (inbound?.action === 'wake' && inbound.hint) content.push({ type: 'text', text: inbound.hint })
+    } catch (error) {
+      log.warn('睡眠门禁出错：' + (error?.message || error))
+    }
+    // #19（按用户要求改）：体力低时不是「记账以后再补」，而是「看到了，先隔 3~5 秒再回」。
+    // 延迟期间她仍是醒着的、消息也还在队列里；不再用 pending-reply（单槽且会被下一句清掉，
+    // 被吞的那句就永远补不回来了）。
+    if (chatId === OWNER_ID && !pendingReply && content.length > 0) {
+      try {
+        const chance = Number(energyOf?.()?.gate?.()?.readIgnoreChance) || 0
+        if (chance > 0 && Math.random() < chance) {
+          bump('read_no_reply')
+          const delay = 3000 + Math.floor(Math.random() * 2000)
+          log.info(`这条先缓一缓（体力低），${Math.round(delay / 1000)} 秒后再回`)
+          const timer = setTimeout(() => {
+            try {
+              if (getConfig().enabled) enqueue(chat, content, userId, false)
+            } catch (error) {
+              log.warn('延迟回复失败：' + (error?.message || error))
+            }
+          }, delay)
+          timer.unref?.()
+          return
+        }
+      } catch (error) {
+        log.warn('已读不回判定出错：' + (error?.message || error))
+      }
+    }
+    // 正常收到主人的消息 → 之前「已读不回」的那条不用补了。
+    if (chatId === OWNER_ID) persistPendingReply(null)
     if (!cfg.enabled) return
     if (content.length === 0) return
     enqueue(chat, content, userId, false)
   }
 
+  // 给 drive 用：取一条「该补一句」的未回消息（默认 5 分钟前、1 小时内，只补主人的）。
+  // #30：没有最大过期会出荒唐事——凌晨被吞的消息，早上还被当成「刚才那条」补回来。
+  // #47：改成异步、跨进程（落盘 + 锁内认领）；认领后写 claimedAt，5 分钟内别的进程不会再补一遍。
+  async function takePendingReply(now = Date.now(), minAgeMs = 5 * 60_000, maxAgeMs = 60 * 60_000) {
+    const usable = (p) => {
+      if (!p || typeof p !== 'object') return null
+      if (p.chatId !== OWNER_ID) return null
+      if (now - (Number(p.at) || 0) < minAgeMs) return null
+      return p
+    }
+    try {
+      return await withFileLock('pending-reply', () => {
+        const disk = readJson(pendingFile(), () => null)
+        const p = usable(disk) || usable(pendingReply)
+        if (!p) {
+          if (disk || pendingReply) persistPendingReply(null)
+          return null
+        }
+        // 别的进程刚认领过 → 让位等它补（5 分钟 TTL，超时说明它没补成，允许重试）。
+        if (p.claimedAt && now - Number(p.claimedAt) < 5 * 60_000) return null
+        if (maxAgeMs > 0 && now - (Number(p.at) || 0) > maxAgeMs) {
+          persistPendingReply(null)
+          return null
+        }
+        pendingReply = null
+        const claimed = { ...p, claimedAt: now }
+        try {
+          writeJson(pendingFile(), claimed)?.catch?.((error) => log.warn('未回消息认领落盘失败：' + (error?.message || error)))
+        } catch {}
+        return claimed
+      }, { staleMs: 15000, timeoutMs: 5000 })
+    } catch (error) {
+      log.warn('未回消息认领失败：' + (error?.message || error))
+      return null
+    }
+  }
+
+  // 补完一句后彻底清掉这条未回消息，避免同一条被反复补。
+  function clearPendingReply() {
+    try { persistPendingReply(null) } catch {}
+  }
+
   // 语音/图片过期清理：整片过期就删片删媒体，并把新的边界推给客户端。
   // （host.js 每小时调一次；每次追加消息后的空闲定时器也会扫。）
-  function cleanupVoice() {
-    const changed = history.sweepAll()
+  async function cleanupVoice() {
+    const changed = await history.sweepAll()
     for (const row of changed) {
       emit?.('history', { chatId: row.chatId, oldestAt: row.oldestAt, droppedBefore: row.oldestAt, hasMore: false })
     }
@@ -644,6 +860,9 @@ export function createHub({
     const firstSender = [...p.senders][0] || ''
     markBusy(chatId)
     try {
+      // 体力低的时候连回复都变慢（#21）：不是装饰，能感觉到她累了。
+      const delay = Number(energyOf()?.gate?.()?.replyDelayMs) || 0
+      if (delay > 0) await new Promise((resolve) => { const t = setTimeout(resolve, delay); t.unref?.() })
       await pushToSession(p.chat, content, firstSender, { wantVoice: p.wantVoice, extraSenders: [...p.senders] })
     } catch (e) {
       bump('errors')
@@ -679,10 +898,19 @@ export function createHub({
     if (textPart) { st.prevText = st.lastText; st.lastText = textPart }
     if (opts.wantVoice) st.wantVoice = true
     if (opts.extraSenders) for (const u of opts.extraSenders) st.senders.add(u)
-    const admitted = await admit(agent, content)
+    // #7：每轮说话前把「此刻的身体状态」当场拼进去（不依赖 systemPrompt.context 的会话缓存）。
+    // 用 user 角色文本包一层，模型只把它当背景，不会当成对方说的话复述出来。
+    const dyn = (() => { try { return String(dynamicContext?.() || '').trim() } catch { return '' } })()
+    const withState = dyn ? [{ type: 'text', text: `【你此刻的身体状态（每轮刷新，不是对方说的，也别说出来）】\n${dyn}` }, ...(content || [])] : content
+    const admitted = await admit(agent, withState)
     startTyping(chat.chatId)
-    await agent.followup({ id: randomUUID(), role: 'user', content: admitted, source: { kind: SOURCE_KIND } })
-    await dsh.sessions.flush(agent.session)
+    try {
+      await agent.followup({ id: randomUUID(), role: 'user', content: admitted, source: { kind: SOURCE_KIND } })
+      await dsh.sessions.flush(agent.session)
+    } finally {
+      // #15：followup 抛错也要收掉「正在输入…」，否则前端一直转圈到本地超时。
+      stopTyping(chat.chatId)
+    }
   }
 
   function runSystemTurn(name, title, prompt, opts = {}) {
@@ -698,7 +926,14 @@ export function createHub({
         st.system = { resolve, reject }
         timer = setTimeout(() => {
           const s = turnState.get(key)
-          if (s && s.system) { s.system = null; s.sysTimer = null; reject(new Error('这一轮超时了')) }
+          if (s && s.system) {
+            s.system = null
+            s.sysTimer = null
+            // 标记超时：这一轮的 turn/end 晚到时不能再落进「正常发货」分支，
+            // 否则 system:diary 这类虚拟会话会真的往会话里发气泡。
+            s.systemTimedOut = true
+            reject(new Error('这一轮超时了'))
+          }
         }, timeoutMs)
         st.sysTimer = timer
         await agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: SOURCE_KIND } })
@@ -725,14 +960,12 @@ export function createHub({
 
   async function resetChat(chatId) {
     const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
-    const m = map()
-    const entry = m.chats[chatId]
+    const entry = map().chats[chatId]
     if (entry) {
       try { await Promise.resolve(reg?.archiveSession?.(entry.sessionId)) } catch (e) {}
       sessionToChat.delete(sessionKey(entry.sessionId))
       turnState.delete(sessionKey(entry.sessionId))
-      delete m.chats[chatId]
-      await saveMap(m)
+      await updateMap((m) => { delete m.chats[chatId] })
     }
   }
 
@@ -784,8 +1017,10 @@ export function createHub({
     pageFileOf,
     historyStats,
     cleanupVoice,
+    takePendingReply,
+    clearPendingReply,
     sessions,
-    stats: () => ({ ...stats }),
+    stats: () => ({ ...stats, media: (stats.images || 0) + (stats.files || 0) }),
     get lastChatAt() { return lastChatAt },
     get lastOwnerChatAt() { return lastOwnerChatAt },
     get lastBotToOwner() { return lastBotToOwner },
