@@ -14,7 +14,7 @@
 //   chat: prune（清聊天历史+重置会话）/ inject（注入假消息）
 import { dataDir, lockAndRun } from '../../core/store.js'
 import { join } from 'node:path'
-import { readdirSync, unlinkSync, rmSync } from 'node:fs'
+import { readdirSync, unlinkSync } from 'node:fs'
 import { OWNER_ID } from '../../chat/access.js'
 
 const num = (v, fallback, min, max) => {
@@ -251,8 +251,6 @@ export function register(router, ctx) {
           try {
             for (const f of readdirSync(dataDir('chats', chatId))) {
               if (f.startsWith('seg-') || f.endsWith('.jsonl')) unlinkSync(join(dataDir('chats', chatId), f))
-              // 上下文轮换留下的 archive-* 归档目录一并清掉（debug 语义 = 该聊天彻底归零）
-              if (f.startsWith('archive-')) { try { rmSync(join(dataDir('chats', chatId), f), { recursive: true, force: true }) } catch {} }
             }
           } catch { /* 目录不存在 */ }
           try { await hub.resetChat(chatId) } catch {}

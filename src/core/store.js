@@ -9,12 +9,7 @@ const osHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
 let cachedBase = null
 function pluginDataBase() {
   if (cachedBase === null) {
-    // C14：AURACHAT_→AURALIFE_ 改过名，旧变量留着兼容（升级后别让老数据「消失」），并提示一次。
-    const oldEnv = process.env.AURACHAT_DATA_DIR
-    if (!process.env.AURALIFE_DATA_DIR && oldEnv) {
-      console.warn('[auralife] 检测到旧变量 AURACHAT_DATA_DIR，数据目录按兼容处理；请改用 AURALIFE_DATA_DIR')
-    }
-    cachedBase = process.env.AURALIFE_DATA_DIR || oldEnv || join(osHome(), 'plugins-data', 'auralife')
+    cachedBase = process.env.AURALIFE_DATA_DIR || join(osHome(), 'plugins-data', 'auralife')
   }
   return cachedBase
 }

@@ -187,8 +187,7 @@ export function createHub({
     const win = contextWindow()
     const real = usageReal.get(chatId)
     const fresh = real && now - real.t < 30 * 60_000 ? real : null
-    // 兜底估算只算「本会话开始之后」的消息：archive 合回来之后 history.stats 包含老对话，
-    // 拿它当窗口用量会虚高、提前轮换（用户指出过这一点）。
+    // 兜底估算只算「本会话开始之后」的消息，避免老对话把窗口用量算虚高、提前轮换（用户指出过这一点）。
     const entry = map().chats[chatId]
     const startedAt = Number(entry && entry.createdAt) || 0
     const tokens = fresh ? real.used : Math.round(history.bytesSince(chatId, startedAt) * 0.4) + ROTATE_FIXED_TOKENS
@@ -197,9 +196,7 @@ export function createHub({
     return u
   }
 
-  // C：上下文轮换只换 session，不动聊天记录。
-  // （旧实现还会 archiveChat 把 chats/<chatId> 的 seg/index rename 走——「查看更早的记录」从此断档，
-  //  等于在 DSH 自己的截断之外又造了一套窗口管理。archive-* 只留给「手动清空历史」。）
+  // C：上下文轮换只换 session，不动聊天记录——不在 DSH 自己的截断之外另造一套窗口管理。
   async function rotateIfNeeded(chat) {
     if (chat.system) return false
     const u = contextUsage(chat.chatId, true)
@@ -226,14 +223,6 @@ export function createHub({
     log.info(`上下文 ${u.ratio}%（${u.source === 'platform' ? '平台真实' : '估算'} ${u.tokens}/${u.window}），换新会话（${chat.chatId} 第 ${r ? r.n + 1 : 1} 转；聊天记录保留）`)
     emit?.('rotate', rec)
     return true
-  }
-
-  // 把早期误搬进 archive-* 的聊天分片合并回来（启动时跑一次；详见 history.restoreArchives）。
-  async function restoreArchives() {
-    try { return await history.restoreArchives() } catch (error) {
-      log.warn('历史归档合并失败：' + (error?.message || error))
-      return { chats: 0, archives: 0, restored: 0 }
-    }
   }
 
   function logChat(chatId, who, text, uid) {
@@ -1132,7 +1121,6 @@ export function createHub({
     resetSessions,
     rotateIfNeeded,
     contextUsage,
-    restoreArchives,
     setLiveWindow,
     lastTextOf: (sid) => turnState.get(sessionKey(sid))?.lastText || '',
     prevTextOf: (sid) => turnState.get(sessionKey(sid))?.prevText || '',

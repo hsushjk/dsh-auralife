@@ -912,7 +912,6 @@ async function connectStream() {
   }
 }
 
-// 历史归档（只读）：上下文轮换把旧对话挪进了 archive-*，网页上给一个能看的地方。
 // B10：DSH 内嵌页会拦原生 confirm()（见发送确认处的注释），二次确认统一用页内弹层。
 function askConfirm(message) {
   return new Promise((resolve) => {
