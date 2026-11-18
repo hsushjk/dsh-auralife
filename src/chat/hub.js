@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, appendFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { mkdirSync, readFileSync, appendFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
@@ -971,6 +971,34 @@ export function createHub({
     }
   }
 
+  // 删客人：按 chatId 收干净——会话映射、聊天分片+媒体、chatlog 当期行。
+  // 单日 chatlog 是追加日志，按行过滤重写（只动这个 chatId 的行，别人一行不碰）。
+  async function purgeChatData(chatId) {
+    const id = String(chatId || '')
+    if (!id) return { ok: false, reason: '没有 chatId' }
+    await resetChat(id)
+    const h = history.purgeChat(id)
+    let chatlog = 0
+    try {
+      for (const f of readdirSync(chatlogDir()).filter((n) => n.endsWith('.jsonl'))) {
+        const p = join(chatlogDir(), f)
+        let raw = ''
+        try { raw = readFileSync(p, 'utf8') } catch { continue }
+        const out = []
+        for (const line of raw.split('\n')) {
+          const t = line.trim()
+          if (!t) continue
+          let rec = null
+          try { rec = JSON.parse(t) } catch { continue }
+          if (rec && rec.chatId === id) { chatlog++; continue }
+          out.push(t)
+        }
+        try { writeFileSync(p, out.length ? out.join('\n') + '\n' : '') } catch {}
+      }
+    } catch {}
+    return { ok: true, ...(h || {}), chatlog }
+  }
+
   async function resetSessions() {
     const m = map()
     for (const chatId of Object.keys(m.chats)) await resetChat(chatId)
@@ -999,6 +1027,7 @@ export function createHub({
     turnSendersAllOwner,
     turnHasOwner,
     resetChat,
+    purgeChatData,
     chatOfSession,
     resetSessions,
     rotateIfNeeded,

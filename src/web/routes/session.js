@@ -157,6 +157,14 @@ export function register(router, ctx) {
   router.prefix('DELETE', 'api/guests/', async (req, res, url, p) => {
     const me = requireOwner(req, res); if (!me) return
     const subject = decodeURIComponent(p.slice('api/guests/'.length))
-    return json(res, await deleteGuest(subject))
+    const r = await deleteGuest(subject)
+    if (r.ok) {
+      // 删客人 = 按 chatId 把属于他的数据收干净（会话/聊天分片+媒体/chatlog/记忆/空间留言），
+      // 否则 id 单调递增虽然不会复用，但旧数据会一直占着盘、也违背「删除」的语义。
+      try { await ctx.deps?.hub?.purgeChatData?.(subject) } catch (error) { log.warn('清理客人聊天数据失败：' + (error?.message || error)) }
+      try { await ctx.deps?.memory?.store?.purgeChat?.(subject) } catch (error) { log.warn('清理客人记忆失败：' + (error?.message || error)) }
+      try { await ctx.deps?.azone?.purgeSubject?.(subject) } catch (error) { log.warn('清理客人空间留言失败：' + (error?.message || error)) }
+    }
+    return json(res, r)
   })
 }

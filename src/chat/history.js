@@ -6,7 +6,7 @@
 // 空闲 2 分钟的 finalize() 只负责兜底（清过期片、清孤儿媒体、整理历史遗留的超长片）。
 // 「查看更早的记录」每次只取上一片，翻页边界和文件边界完全一致。
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { dataDir, readJson, writeJson, withFileLock } from '../core/store.js'
 import { mimeOf } from '../core/image.js'
@@ -404,6 +404,18 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return { changed: dropped > 0, dropped, orphans, oldestAt: oldestAt(chatId), hasMore: totalOf(chatId) > 0 }
   }
 
+  // 删客人时的彻底清理：这个 chatId 的全部聊天分片 + 媒体目录一起删。
+  // （只有删账号时调用；日常清理走 sweep，不会删整个会话目录。）
+  function purgeChat(chatId) {
+    const t = timers.get(chatId)
+    if (t) { clearTimeout(t); timers.delete(chatId) }
+    let removed = 0
+    for (const dir of [chatDir(chatId), mediaDir(chatId)]) {
+      try { rmSync(dir, { recursive: true, force: true }); removed++ } catch {}
+    }
+    return { removed }
+  }
+
   const lockId = (chatId) => `hist-${chatId}`
   const histLock = { staleMs: 10000, timeoutMs: 20000 }
 
@@ -533,6 +545,6 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
   return {
     append, patchLast, page, pageFile, recent, last, oldestAt, totalOf,
     sweep, sweepAll, touch, finalize, splitCurrent, closeAll, stats, reapOrphanMedia,
-    saveMedia, mediaPath: mediaFile, mediaDir, chatDir, archiveChat,
+    saveMedia, mediaPath: mediaFile, mediaDir, chatDir, archiveChat, purgeChat,
   }
 }

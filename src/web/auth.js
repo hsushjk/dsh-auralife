@@ -131,7 +131,10 @@ export function listGuests() {
 
 function nextGuestId(u) {
   const ids = Object.values(u.guests || {}).map((g) => g.id).filter((n) => Number.isFinite(n))
-  return ids.length ? Math.max(...ids) + 1 : 1
+  // 单调递增、永不复用：删光客人再建也不回到 guest-1（否则新客人会继承前一个人的
+  // 聊天记录/媒体/事实——chatId 就是 subject）。
+  const max = ids.length ? Math.max(...ids) : 0
+  return Math.max(Number(u.guestSeq) || 0, max) + 1
 }
 
 export async function createGuest({ username, displayName, note }) {
@@ -142,6 +145,7 @@ export async function createGuest({ username, displayName, note }) {
     const subject = 'guest-' + id
     const password = randomBytes(4).toString('hex')
     const salt = randomBytes(16).toString('hex')
+    u.guestSeq = id
     u.guests[subject] = {
       subject,
       role: 'guest',
@@ -161,18 +165,13 @@ export async function createGuest({ username, displayName, note }) {
 
 // 改权限要立刻作用到已登录的会话，否则客人要等重新登录才生效。
 async function syncSessionLevels(subject, level) {
-  try {
-    await updateSessions((s) => {
-      for (const rec of Object.values(s)) {
-        if (rec && rec.subject === subject) rec.level = level
-      }
-    })
-  } catch (error) {
-    // 写不进锁就退回旧行为（最多这一次没同步），别让改权限整单失败。
-    const s = loadSessions()
-    for (const rec of Object.values(s)) if (rec && rec.subject === subject) rec.level = level
-    saveSessions(s)
-  }
+  // #8：拿不到锁就「整份读改写」是更糟的行为——正好会把别的进程刚写进去的会话盖回去。
+  // 这里失败就抛出去，由调用方把「没同步成功」如实报给面板（而不是吞掉显示成功）。
+  await updateSessions((s) => {
+    for (const rec of Object.values(s)) {
+      if (rec && rec.subject === subject) rec.level = level
+    }
+  })
 }
 
 export async function updateGuest(subject, { displayName, note, username, password, level, confirm } = {}) {
@@ -193,7 +192,15 @@ export async function updateGuest(subject, { displayName, note, username, passwo
     }
     return { ok: true, level: g.level }
   })
-  if (out.ok && (level === 'full' || level === 'social')) await syncSessionLevels(subject, out.level)
+  if (out.ok && (level === 'full' || level === 'social')) {
+    try {
+      await syncSessionLevels(subject, out.level)
+    } catch (error) {
+      // 资料/权限已经存进 users.json 了，但已登录会话还是旧档位：如实告诉面板，
+      // 让它提示「请再点一次重试」，而不是显示成功让人以为生效了。
+      return { ok: false, reason: '权限已保存，但已登录的会话没同步（别的进程正在写会话）：' + (error?.message || error) + '；请再点一次重试' }
+    }
+  }
   const { level: _ignored, ...rest } = out
   return rest
 }

@@ -10,7 +10,7 @@
 // 体量（DESIGN §5.2）：episode 200-400B/条、fact ~300B/条，一年 <5MB，
 // 启动时全量载入内存，append 只碰当月分片。
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs'
+import { appendFileSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { dataDir, ensureDir, numOr, withFileLock } from '../core/store.js'
 import { inferKind } from './similar.js'
@@ -312,6 +312,44 @@ export function createMemStore({ log = console } = {}) {
     }
   }
 
+  // 按 chatId 清理一个会话的全部记忆（删客人时用）：重写分片、丢掉该会话的事实/事件
+  // 以及连着这些事实的联想边。返回各 kind 删掉的条数。
+  function purgeChat(chatId) {
+    const id = String(chatId || '')
+    if (!id) return { facts: 0, episodes: 0, edges: 0 }
+    const removed = new Set()
+    const filterKind = (kind, keepFn) => {
+      const dir = dirOf(kind)
+      let names = []
+      try { names = readdirSync(dir).filter((f) => f.endsWith('.jsonl')) } catch { return 0 }
+      let dropped = 0
+      for (const name of names) {
+        const p = join(dir, name)
+        let txt = ''
+        try { txt = readFileSync(p, 'utf8') } catch { continue }
+        const keep = []
+        for (const line of txt.split('\n')) {
+          const s = line.trim()
+          if (!s) continue
+          let rec = null
+          try { rec = JSON.parse(s) } catch { continue }
+          if (keepFn(rec)) keep.push(s)
+          else {
+            dropped++
+            if (kind === 'facts' && rec.id) removed.add(rec.id)
+          }
+        }
+        if (dropped) { try { writeFileSync(p, keep.length ? keep.join('\n') + '\n' : '') } catch {} }
+      }
+      return dropped
+    }
+    const facts = filterKind('facts', (r) => r.chatId !== id && r.subj !== id)
+    const eps = filterKind('episodes', (r) => r.chatId !== id)
+    const edges = filterKind('edges', (r) => !removed.has(r.a) && !removed.has(r.b))
+    invalidate()
+    return { facts, episodes: eps, edges }
+  }
+
   // 破坏性清空（仅 debug 用，见 web/routes/debug.js）：删掉该 kind 的全部 jsonl。
   function clear(kind) {
     const dir = dirOf(kind)
@@ -333,6 +371,6 @@ export function createMemStore({ log = console } = {}) {
     currentFacts, findFact, headOf, factsBySubj,
     bumpHit, supersede, forget, linkEvidence,
     markSpoken, markAudited, setFactKind,
-    stats, newId, monthKey, clear,
+    stats, newId, monthKey, clear, purgeChat,
   }
 }

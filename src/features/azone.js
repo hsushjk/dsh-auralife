@@ -268,6 +268,36 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     return { today: todayCount, total: s.history.length, idleLeft, eventLeft }
   }
 
+  // 删客人：按登录 subject 清掉他在空间里的留言/回复（addComment/addReply 的 from 就是 me.subject）。
+  // 日记 body 里如果提到过这个客人属于聊天内容，不在这里动——只清结构化留言，避免误伤她的创作。
+  function purgeSubject(subject) {
+    const subj = String(subject || '')
+    if (!subj) return Promise.resolve({ ok: false, removed: 0 })
+    return update((s) => {
+      let removed = 0
+      for (const e of s.history || []) {
+        if (!Array.isArray(e.comments)) continue
+        const keep = []
+        for (const c of e.comments) {
+          if (c.from === subj) {
+            // 整条留言都删掉（含下面所有回复）；计数只算他本人的那些记录。
+            removed++
+            if (Array.isArray(c.replies)) removed += c.replies.filter((r) => r.from === subj).length
+            continue
+          }
+          if (Array.isArray(c.replies)) {
+            const keptReplies = c.replies.filter((r) => r.from !== subj)
+            removed += c.replies.length - keptReplies.length
+            c.replies = keptReplies
+          }
+          keep.push(c)
+        }
+        e.comments = keep
+      }
+      return { ok: true, removed }
+    })
+  }
+
   return {
     post,
     remove,
@@ -281,6 +311,7 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
     addReply,
     deleteComment,
     deleteReply,
+    purgeSubject,
     stats,
     state,
   }
