@@ -35,7 +35,7 @@ export function register(router, ctx) {
     if (!needSetup()) return json(res, { ok: false, reason: '已经有主人了' })
     const b = await readBody(req)
     if (!b.pledge) return json(res, { ok: false, reason: '先答应两件事：不用 Ta 开播圈钱、不放 Ta 污染社区' })
-    const r = setupOwner({ username: b.username, password: b.password })
+    const r = await setupOwner({ username: b.username, password: b.password })
     if (r.ok) {
       const extra = { pledge: true }
       if (b.botName) extra.botName = String(b.botName).slice(0, 40)
@@ -125,7 +125,7 @@ export function register(router, ctx) {
   router.add('POST', 'api/account/password', async (req, res) => {
     const me = requireUser(req, res); if (!me) return
     const b = await readBody(req)
-    return json(res, changePassword(me.subject, b.oldPassword, b.newPassword))
+    return json(res, await changePassword(me.subject, b.oldPassword, b.newPassword))
   })
 
   router.add('GET', 'api/guests', async (req, res) => {
@@ -144,7 +144,7 @@ export function register(router, ctx) {
   router.add('POST', 'api/guests', async (req, res) => {
     const me = requireOwner(req, res); if (!me) return
     const b = await readBody(req)
-    return json(res, createGuest({ username: b.username, displayName: b.displayName, note: b.note, level: b.level }))
+    return json(res, await createGuest({ username: b.username, displayName: b.displayName, note: b.note, level: b.level }))
   })
 
   router.prefix('PATCH', 'api/guests/', async (req, res, url, p) => {

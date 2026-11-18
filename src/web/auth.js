@@ -35,26 +35,38 @@ async function updateSessions(mutator) {
   }, SESSIONS_LOCK)
 }
 
+// #8 同一族：users.json 以前也是 loadUsers() 改完 saveUsers() 整份裸写，
+// 两个进程同时建客人/改权限会互相盖掉。所有写操作统一进锁。
+const USERS_LOCK = { staleMs: 10000, timeoutMs: 8000 }
+async function updateUsers(mutator) {
+  return withFileLock('web-users', () => {
+    const u = loadUsers()
+    const out = mutator(u)
+    saveUsers(u)
+    return out
+  }, USERS_LOCK)
+}
+
 export function needSetup() {
   return !loadUsers().owner
 }
 
-export function setupOwner({ username, password }) {
-  const u = loadUsers()
-  if (u.owner) return { ok: false, reason: '已经有主人了' }
+export async function setupOwner({ username, password }) {
   if (!username || !password) return { ok: false, reason: '用户名和密码都不能为空' }
   if (String(password).length < 6) return { ok: false, reason: '密码至少 6 位' }
-  const salt = randomBytes(16).toString('hex')
-  u.owner = {
-    subject: 'owner',
-    role: 'owner',
-    username: String(username),
-    salt,
-    hash: hashPassword(password, salt),
-    createdAt: Date.now(),
-  }
-  saveUsers(u)
-  return { ok: true }
+  return updateUsers((u) => {
+    if (u.owner) return { ok: false, reason: '已经有主人了' }
+    const salt = randomBytes(16).toString('hex')
+    u.owner = {
+      subject: 'owner',
+      role: 'owner',
+      username: String(username),
+      salt,
+      hash: hashPassword(password, salt),
+      createdAt: Date.now(),
+    }
+    return { ok: true }
+  })
 }
 
 export function verify(username, password) {
@@ -122,29 +134,29 @@ function nextGuestId(u) {
   return ids.length ? Math.max(...ids) + 1 : 1
 }
 
-export function createGuest({ username, displayName, note }) {
-  const u = loadUsers()
-  if (!u.owner) return { ok: false, reason: '还没有主人' }
+export async function createGuest({ username, displayName, note }) {
   if (!username) return { ok: false, reason: '用户名不能为空' }
-  const id = nextGuestId(u)
-  const subject = 'guest-' + id
-  const password = randomBytes(4).toString('hex')
-  const salt = randomBytes(16).toString('hex')
-  u.guests[subject] = {
-    subject,
-    role: 'guest',
-    id,
-    username: String(username),
-    displayName: String(displayName || username),
-    note: String(note || ''),
-    // 默认只聊天。完全权限是主人事后手动点开的白名单，不在创建时一把全开（#44）。
-    level: 'social',
-    salt,
-    hash: hashPassword(password, salt),
-    createdAt: Date.now(),
-  }
-  saveUsers(u)
-  return { ok: true, subject, id, username: String(username), password }
+  return updateUsers((u) => {
+    if (!u.owner) return { ok: false, reason: '还没有主人' }
+    const id = nextGuestId(u)
+    const subject = 'guest-' + id
+    const password = randomBytes(4).toString('hex')
+    const salt = randomBytes(16).toString('hex')
+    u.guests[subject] = {
+      subject,
+      role: 'guest',
+      id,
+      username: String(username),
+      displayName: String(displayName || username),
+      note: String(note || ''),
+      // 默认只聊天。完全权限是主人事后手动点开的白名单，不在创建时一把全开（#44）。
+      level: 'social',
+      salt,
+      hash: hashPassword(password, salt),
+      createdAt: Date.now(),
+    }
+    return { ok: true, subject, id, username: String(username), password }
+  })
 }
 
 // 改权限要立刻作用到已登录的会话，否则客人要等重新登录才生效。
@@ -164,52 +176,64 @@ async function syncSessionLevels(subject, level) {
 }
 
 export async function updateGuest(subject, { displayName, note, username, password, level, confirm } = {}) {
-  const u = loadUsers()
-  const g = u.guests[subject]
-  if (!g) return { ok: false, reason: '没有这个客人' }
   // #4：给客人开完全权限要二次确认（前端 confirm 后带 confirm:true），防误点一键开总闸。
   if (level === 'full' && confirm !== true) return { ok: false, reason: '给客人完全权限需要二次确认' }
-  if (displayName !== undefined) g.displayName = String(displayName)
-  if (note !== undefined) g.note = String(note)
-  if (username !== undefined && username !== '') g.username = String(username)
-  if (level === 'full' || level === 'social') g.level = level
-  if (password) {
-    if (String(password).length < 6) return { ok: false, reason: '密码至少 6 位' }
-    g.salt = randomBytes(16).toString('hex')
-    g.hash = hashPassword(password, g.salt)
-  }
-  saveUsers(u)
-  if (level === 'full' || level === 'social') await syncSessionLevels(subject, g.level)
-  return { ok: true }
+  if (password && String(password).length < 6) return { ok: false, reason: '密码至少 6 位' }
+  // #8：改客人资料/权限也是整份写，进锁；会话 level 在锁外同步（另一把锁）。
+  const out = await updateUsers((u) => {
+    const g = u.guests[subject]
+    if (!g) return { ok: false, reason: '没有这个客人' }
+    if (displayName !== undefined) g.displayName = String(displayName)
+    if (note !== undefined) g.note = String(note)
+    if (username !== undefined && username !== '') g.username = String(username)
+    if (level === 'full' || level === 'social') g.level = level
+    if (password) {
+      g.salt = randomBytes(16).toString('hex')
+      g.hash = hashPassword(password, g.salt)
+    }
+    return { ok: true, level: g.level }
+  })
+  if (out.ok && (level === 'full' || level === 'social')) await syncSessionLevels(subject, out.level)
+  const { level: _ignored, ...rest } = out
+  return rest
 }
 
-export function changePassword(subject, oldPassword, newPassword) {
-  const u = loadUsers()
-  const acc = subject === 'owner' ? u.owner : u.guests?.[subject]
-  if (!acc) return { ok: false, reason: '没有这个账号' }
+export async function changePassword(subject, oldPassword, newPassword) {
   if (!newPassword) return { ok: false, reason: '新密码不能为空' }
   if (String(newPassword).length < 6) return { ok: false, reason: '密码至少 6 位' }
-  const h = hashPassword(oldPassword, acc.salt)
-  if (h.length !== acc.hash.length || !timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(acc.hash, 'hex'))) {
-    return { ok: false, reason: '旧密码不对' }
-  }
-  acc.salt = randomBytes(16).toString('hex')
-  acc.hash = hashPassword(newPassword, acc.salt)
-  saveUsers(u)
-  return { ok: true }
+  // #8：改密码也是整份写，进锁，避免和别的写操作互相覆盖。
+  return updateUsers((u) => {
+    const acc = subject === 'owner' ? u.owner : u.guests?.[subject]
+    if (!acc) return { ok: false, reason: '没有这个账号' }
+    const h = hashPassword(oldPassword, acc.salt)
+    if (h.length !== acc.hash.length || !timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(acc.hash, 'hex'))) {
+      return { ok: false, reason: '旧密码不对' }
+    }
+    acc.salt = randomBytes(16).toString('hex')
+    acc.hash = hashPassword(newPassword, acc.salt)
+    return { ok: true }
+  })
 }
 
 export async function deleteGuest(subject) {
-  const u = loadUsers()
-  if (!u.guests[subject]) return { ok: false, reason: '没有这个客人' }
-  delete u.guests[subject]
-  saveUsers(u)
-
-  // #8：删会话也是整份写，必须进锁，否则会盖掉别的进程刚登录/登出的会话。
-  await updateSessions((s) => {
-    for (const [k, v] of Object.entries(s)) if (v.subject === subject) delete s[k]
-  })
-  return { ok: true }
+  if (!loadUsers().guests?.[subject]) return { ok: false, reason: '没有这个客人' }
+  // 先清会话、再删用户：反过来的话，会话写失败会留下「指向不存在客人」的孤儿会话。
+  try {
+    await updateSessions((s) => {
+      for (const [k, v] of Object.entries(s)) if (v.subject === subject) delete s[k]
+    })
+  } catch (error) {
+    return { ok: false, reason: '清理这个客人的登录会话失败：' + (error?.message || error) }
+  }
+  try {
+    return await updateUsers((u) => {
+      if (!u.guests) return { ok: true }
+      delete u.guests[subject]
+      return { ok: true }
+    })
+  } catch (error) {
+    return { ok: false, reason: '删除客人失败：' + (error?.message || error) }
+  }
 }
 
 export function displayNameOf(subject) {
