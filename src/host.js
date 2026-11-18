@@ -314,6 +314,11 @@ export function apply(ctx) {
     },
   })
 
+  // 早期版本轮换时把聊天分片搬进 archive-*（「查看更早的记录」断档），启动时合并回来。
+  hub.restoreArchives().then((r) => {
+    if (r && r.restored) log.info(`历史归档合并：${r.restored} 条回到 ${r.chats} 个会话（${r.archives} 个归档目录）`)
+  }).catch((error) => log.warn('历史归档合并失败：' + (error?.message || error)))
+
   memory = createMemoryV2({ dsh: ctx, getConfig, hub, log: logger.child('memory'), life, self, chemistry })
   azone = createAzone({
     getConfig, hub, log: logger.child('azone'), life,

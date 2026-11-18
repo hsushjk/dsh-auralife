@@ -594,8 +594,91 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return { ok: true, dir: name, total, messages: messages.slice(Math.max(0, total - 500)) }
   }
 
+
+  // 早期轮换把 seg/index 整份 rename 进 archive-*，导致「查看更早的记录」断档。
+  // 这里把归档分片合并回主历史：按 t 重排、按 id 去重、重新分片，成功后删 archive-*。
+  // 在 hist-<chatId> 锁内执行，和 append/sweep 串行。
+  function restoreArchivesLocked(chatId) {
+    let names = []
+    try { names = readdirSync(chatDir(chatId)).filter((n) => /^archive-\d+$/.test(n)) } catch { return { archives: 0, restored: 0 } }
+    if (!names.length) return { archives: 0, restored: 0 }
+    const byKey = new Map()
+    const addMsg = (m) => {
+      if (!m || typeof m !== 'object') return
+      const key = m.id ? 'id:' + m.id : `t:${m.t}|who:${m.who}|text:${String(m.text || '').slice(0, 120)}`
+      if (!byKey.has(key)) byKey.set(key, m)
+    }
+    for (const name of names) {
+      const dir = join(chatDir(chatId), name)
+      let files = []
+      try { files = readdirSync(dir).filter((f) => f.endsWith('.json') && f !== 'index.json') } catch {}
+      for (const f of files) {
+        const data = readJson(join(dir, f), null)
+        for (const m of (data && Array.isArray(data.messages) ? data.messages : [])) addMsg(m)
+      }
+    }
+    const idx = readIndex(chatId)
+    const oldIds = idx.segments.map((seg) => seg.id)
+    for (const seg of idx.segments) {
+      const data = readSeg(chatId, seg.id)
+      for (const m of (data?.messages || [])) addMsg(m)
+    }
+    const merged = [...byKey.values()].sort((a, b) => (Number(a.t) || 0) - (Number(b.t) || 0))
+    for (const id of oldIds) { try { unlinkSync(segFile(chatId, id)) } catch {} }
+    const segments = []
+    for (let i = 0; i < merged.length; i += SEGMENT_LIMIT) {
+      const chunk = merged.slice(i, i + SEGMENT_LIMIT)
+      const id = newSegmentId(segments.length + 1)
+      writeJson(segFile(chatId, id), { chatId, id, from: chunk[0].t, to: chunk[chunk.length - 1].t, messages: chunk })
+      segments.push({ id, from: chunk[0].t, to: chunk[chunk.length - 1].t, count: chunk.length })
+    }
+    writeIndex(chatId, { ...emptyIndex(chatId), segments })
+    for (const name of names) { try { rmSync(join(chatDir(chatId), name), { recursive: true, force: true }) } catch {} }
+    return { archives: names.length, restored: merged.length }
+  }
+
+  // 把 chats/ 下所有会话的 archive-* 合回主历史（启动时兜底跑一次；没有归档就是空操作）。
+  function restoreArchives() {
+    let ids = []
+    try { ids = readdirSync(chatsRoot()) } catch { return Promise.resolve({ chats: 0, archives: 0, restored: 0 }) }
+    const totals = { chats: 0, archives: 0, restored: 0 }
+    let chain = Promise.resolve()
+    for (const id of ids) {
+      chain = chain.then(async () => {
+        try {
+          const r = await lockAndRun(lockId(id), () => restoreArchivesLocked(id), histLock)
+          if (r && (r.archives || r.restored)) {
+            totals.chats += 1
+            totals.archives += r.archives
+            totals.restored += r.restored
+          }
+        } catch (error) {
+          log.warn?.(`历史归档合并失败（${id}）：${error?.message || error}`)
+        }
+      })
+    }
+    return chain.then(() => totals)
+  }
+
+  // 轮换兜底估算只数「本会话开始之后」的消息（archive 合回来之后 stats 会包含老对话，
+  // 再拿它当上下文用量会虚高——用户已经指出过这件事）。
+  function bytesSince(chatId, since) {
+    const t0 = Number(since) || 0
+    const idx = readIndex(chatId)
+    let bytes = 0
+    for (const seg of idx.segments) {
+      if (Number(seg.to) < t0) continue
+      const data = readSeg(chatId, seg.id)
+      for (const m of (data?.messages || [])) {
+        if (Number(m.t) >= t0) bytes += Buffer.byteLength(JSON.stringify(m))
+      }
+    }
+    return bytes
+  }
+
   return {
     append, patchLast, page, pageFile, recent, last, oldestAt, totalOf,
+    bytesSince, restoreArchives,
     sweep, sweepAll, touch, finalize, splitCurrent, closeAll, stats, reapOrphanMedia,
     saveMedia, mediaPath: mediaFile, mediaDir, chatDir, archiveChat, purgeChat,
     listArchives, readArchive,
