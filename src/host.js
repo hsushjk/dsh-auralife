@@ -324,8 +324,8 @@ export function apply(ctx) {
   // 命中计数已迁到 mem/fact-hits.json，这里把历史重复行清掉（进锁，多进程同时启动也安全）。
   // 没有重复行时它几乎不做事，启动开销可以忽略。
   memory.compactFacts?.()
-    .then((r) => { if (r && r.removed) logger.info(`记忆整理：清掉 ${r.removed} 行重复事实（${r.files} 个分片）`) })
-    .catch((error) => logger.warn('记忆整理失败：' + (error?.message || error)))
+    .then((r) => { if (r && r.removed) log.info(`记忆整理：清掉 ${r.removed} 行重复事实（${r.files} 个分片）`) })
+    .catch((error) => log.warn('记忆整理失败：' + (error?.message || error)))
   azone = createAzone({
     getConfig, hub, log: logger.child('azone'), life,
 

@@ -18,6 +18,8 @@ let currentView = 'chat'
 let stream = null
 // 聊天记录分页状态：服务端一片 100 条，往上翻一页取比 oldestAt 更早的 100 条
 let historyState = { oldestAt: 0, hasMore: false, loading: false }
+// 正在引用的那条消息（右键气泡 → 引用）。发送成功后清空；快照随消息正文一起发给服务端。
+let pendingQuote = null
 
 const $ = (s, el) => (el || document).querySelector(s)
 const $$ = (s, el) => Array.from((el || document).querySelectorAll(s))
@@ -564,6 +566,7 @@ function renderChat(main) {
     '<div class="msgs" id="msgs"></div>' +
     '<div class="typing" id="typing"></div>' +
     '<div class="composer">' +
+    '<div class="composer-quote" id="quote-bar" hidden></div>' +
     '<div class="composer-tools"><button class="tool" id="tool-image">图片</button>' +
     '<button class="tool" id="tool-sticker">表情</button>' +
     '<button class="tool" id="tool-voice">语音</button>' +
@@ -592,6 +595,7 @@ function renderChat(main) {
   $('#file-upload').onchange = sendFiles
   $('#tool-sticker').onclick = (e) => openStickerPicker(e.currentTarget)
   setupVoiceButton()
+  setupQuoteUi()
   loadMessages()
 }
 
@@ -674,6 +678,7 @@ function buildMessageNode(m) {
   wrap.className = 'msg ' + (mine ? 'me' : 'her')
   wrap.dataset.t = String(m.t || '')
   if (m.id) wrap.dataset.id = String(m.id)
+  wrap.__msg = m // 右键菜单用：不用再从 DOM 反推消息
   let inner = ''
   if (m.kind === 'voice') {
     const src = m.mediaId ? mediaUrl(m) : (m.voice ? 'data:' + (m.voiceMime || 'audio/mpeg') + ';base64,' + m.voice : '')
@@ -698,8 +703,13 @@ function buildMessageNode(m) {
     inner = esc(m.text || '')
   }
   if (mine && m.kind === 'image' && cfg?.stickers?.steal !== false) inner += '<button class="collect" data-collect="' + esc(m.id || '') + '">收进表情库</button>'
+  const quoteHtml = m.quote
+    ? '<div class="quote" data-quote="' + esc(m.quote.id || '') + '" title="点一下跳到被引用的那条">' +
+      '<span class="q-name">' + esc(quoteLabelOf(m.quote)) + '</span>' +
+      '<span class="q-text">' + esc(m.quote.text || '') + '</span></div>'
+    : ''
   wrap.innerHTML = (mine ? '' : '<div class="sender">' + esc(bot()) + '</div>') +
-    '<div class="bubble"><div class="body">' + inner + '</div><span class="meta">' + esc(fmtClock(m.t)) + '</span></div>'
+    '<div class="bubble">' + quoteHtml + '<div class="body">' + inner + '</div><span class="meta">' + esc(fmtClock(m.t)) + '</span></div>'
   return wrap
 }
 
@@ -749,6 +759,96 @@ function prependMessage(m) {
 function scrollDown() { const box = $('#msgs'); if (box) box.scrollTop = box.scrollHeight }
 function setTyping(on) { const t = $('#typing'); if (t) t.textContent = on ? bot() + ' 正在输入…' : '' }
 
+// ——引用：右键气泡 → 菜单 → 引用；发送后气泡里带被引用的那条——
+function quoteLabelOf(q) { return q && q.who === 'bot' ? bot() : '你' }
+
+function quoteTextOfMessage(m) {
+  if (!m) return ''
+  if (m.kind === 'voice') return m.heard ? '[语音] ' + m.heard : String(m.text || '[语音]')
+  if (m.kind === 'image') return '[图片]'
+  if (m.kind === 'sticker') return '[表情' + (m.name ? ' ' + m.name : '') + ']'
+  if (m.kind === 'file') return '[文件] ' + (m.fileName || '')
+  return String(m.text || '').slice(0, 300)
+}
+
+function setPendingQuote(m) {
+  pendingQuote = m
+    ? { id: String(m.id || ''), who: m.who === 'bot' ? 'bot' : 'user', text: quoteTextOfMessage(m), at: Number(m.t) || 0, kind: m.kind || 'text' }
+    : null
+  renderQuoteBar()
+}
+
+function renderQuoteBar() {
+  const bar = $('#quote-bar')
+  if (!bar) return
+  if (!pendingQuote) { bar.hidden = true; bar.innerHTML = ''; return }
+  bar.hidden = false
+  bar.innerHTML = '<span class="qb-label">引用 ' + esc(quoteLabelOf(pendingQuote)) + '：</span>' +
+    '<span class="qb-text">' + esc(pendingQuote.text) + '</span>' +
+    '<button type="button" class="qb-x" title="取消引用" aria-label="取消引用">×</button>'
+  bar.querySelector('.qb-x').onclick = () => setPendingQuote(null)
+}
+
+function focusQuoted(id) {
+  const node = document.querySelector('.msg[data-id="' + cssId(id) + '"]')
+  if (!node) { toast('那条消息不在当前加载的记录里', 'err'); return }
+  node.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  node.classList.add('flash')
+  setTimeout(() => node.classList.remove('flash'), 1400)
+}
+
+function setupMessageMenu() {
+  let menu = document.getElementById('msg-menu')
+  if (!menu) {
+    menu = document.createElement('div')
+    menu.id = 'msg-menu'
+    menu.className = 'msg-menu'
+    menu.hidden = true
+    menu.innerHTML = '<button type="button" data-act="quote">引用这条</button>'
+    document.body.appendChild(menu)
+  }
+  let target = null
+  const hide = () => { menu.hidden = true; target = null }
+  if (!menu.__bound) {
+    menu.__bound = true
+    menu.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-act="quote"]')
+      if (!btn) return
+      if (target && target.__msg) setPendingQuote(target.__msg)
+      hide()
+    })
+    document.addEventListener('click', (e) => { if (!menu.contains(e.target)) hide() })
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hide() })
+    window.addEventListener('resize', hide)
+    window.addEventListener('scroll', hide, true)
+  }
+  const msgs = $('#msgs')
+  if (msgs && !msgs.__ctxBound) {
+    msgs.__ctxBound = true
+    msgs.addEventListener('contextmenu', (e) => {
+      const node = e.target.closest('.msg')
+      if (!node || !node.__msg) return
+      e.preventDefault()
+      target = node
+      menu.hidden = false
+      const w = menu.offsetWidth || 120
+      const h = menu.offsetHeight || 40
+      menu.style.left = Math.max(8, Math.min(e.clientX, window.innerWidth - w - 8)) + 'px'
+      menu.style.top = Math.max(8, Math.min(e.clientY, window.innerHeight - h - 8)) + 'px'
+    })
+    // 点引用块 → 跳到原消息
+    msgs.addEventListener('click', (e) => {
+      const q = e.target.closest('.quote')
+      if (q && q.dataset.quote) focusQuoted(q.dataset.quote)
+    })
+  }
+}
+
+function setupQuoteUi() {
+  renderQuoteBar()
+  setupMessageMenu()
+}
+
 async function sendText() {
   const inp = $('#input')
   const text = inp.value.trim()
@@ -756,9 +856,9 @@ async function sendText() {
   inp.value = ''
   inp.style.height = 'auto'
   api('/api/typing', { method: 'POST', body: { typing: false } }).catch(() => {})
-  const r = await api('/api/messages', { method: 'POST', body: { text } })
+  const r = await api('/api/messages', { method: 'POST', body: { text, ...(pendingQuote ? { quote: pendingQuote } : {}) } })
   if (!r.ok) toast(r.reason || '没发出去', 'err')
-  else playSound('out')
+  else { playSound('out'); setPendingQuote(null) }
 }
 
 async function sendImage(e) {
@@ -771,8 +871,9 @@ async function sendImage(e) {
   const rd = new FileReader()
   rd.onload = async () => {
     const data = String(rd.result).split(',')[1] || ''
-    const r = await api('/api/messages', { method: 'POST', body: { text: '', images: [{ data, mediaType: f.type || 'image/png', name: f.name }] } })
+    const r = await api('/api/messages', { method: 'POST', body: { text: '', images: [{ data, mediaType: f.type || 'image/png', name: f.name }], ...(pendingQuote ? { quote: pendingQuote } : {}) } })
     if (!r.ok) toast(r.reason || r.message || '没发出去', 'err')
+    else setPendingQuote(null)
   }
   rd.readAsDataURL(f)
 }
@@ -828,9 +929,9 @@ function showFileConfirm(items, totalRaw, totalB64) {
       if (i.mime.startsWith('image/')) images.push({ data: i.data, mediaType: i.mime, name: i.f.name })
       else files.push({ data: i.data, mediaType: i.mime, name: i.f.name })
     }
-    const r = await api('/api/messages', { method: 'POST', body: { text: '', images, files } })
+    const r = await api('/api/messages', { method: 'POST', body: { text: '', images, files, ...(pendingQuote ? { quote: pendingQuote } : {}) } })
     if (!r.ok) toast(r.reason || r.message || '没发出去', 'err')
-    else playSound('out')
+    else { playSound('out'); setPendingQuote(null) }
   }
   ov.addEventListener('click', (e2) => { if (e2.target === ov) ov.remove() })
 }
@@ -967,8 +1068,9 @@ async function startPcmRecording(btn) {
     const rd = new FileReader()
     rd.onload = async () => {
       const data = String(rd.result).split(',')[1] || ''
-      const r = await api('/api/messages', { method: 'POST', body: { text: '', voice: { data, mime: 'audio/wav', dur } } })
+      const r = await api('/api/messages', { method: 'POST', body: { text: '', voice: { data, mime: 'audio/wav', dur }, ...(pendingQuote ? { quote: pendingQuote } : {}) } })
       if (!r.ok) toast(r.reason || '语音没发出去', 'err')
+      else setPendingQuote(null)
     }
     rd.readAsDataURL(blob)
   }
@@ -992,7 +1094,8 @@ function pickAudioFile() {
       const rd = new FileReader()
       rd.onload = async () => {
         const data = String(rd.result).split(',')[1] || ''
-        const r = await api('/api/messages', { method: 'POST', body: { text: '', voice: { data, mime: f.type || 'audio/wav', dur } } })
+        const r = await api('/api/messages', { method: 'POST', body: { text: '', voice: { data, mime: f.type || 'audio/wav', dur }, ...(pendingQuote ? { quote: pendingQuote } : {}) } })
+        if (r.ok) setPendingQuote(null)
         toast(r.ok ? '发出去了' : (r.reason || '没发出去'), r.ok ? '' : 'err')
       }
       rd.readAsDataURL(f)
@@ -1096,8 +1199,9 @@ async function openStickerPicker(anchor) {
     const b = e.target.closest('[data-md5]')
     if (!b) return
     box.remove()
-    const res = await api('/api/messages', { method: 'POST', body: { text: '', sticker: b.dataset.md5 } })
+    const res = await api('/api/messages', { method: 'POST', body: { text: '', sticker: b.dataset.md5, ...(pendingQuote ? { quote: pendingQuote } : {}) } })
     if (!res.ok) toast(res.reason || '没发出去', 'err')
+    else setPendingQuote(null)
   }
   setTimeout(() => document.addEventListener('click', function h(ev) { if (!box.contains(ev.target)) { box.remove(); document.removeEventListener('click', h) } }), 0)
 }

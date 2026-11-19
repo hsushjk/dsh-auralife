@@ -10,7 +10,7 @@
 // 体量（DESIGN §5.2）：episode 200-400B/条、fact ~300B/条，一年 <5MB，
 // 启动时全量载入内存，append 只碰当月分片。
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { dataDir, ensureDir, numOr, lockAndRun, readJson, writeJson } from '../core/store.js'
 import { inferKind } from './similar.js'
@@ -370,7 +370,8 @@ export function createMemStore({ log = console } = {}) {
             if (kind === 'facts' && rec.id) removed.add(rec.id)
           }
         }
-        if (dropped) writeFileSync(p, keep.length ? keep.join('\n') + '\n' : '')
+        // 整份重写用临时文件+改名：删客人/整理时断电不能把整月分片截断
+        if (dropped) writeTextAtomic(p, keep.length ? keep.join('\n') + '\n' : '')
       }
       return dropped
     }
@@ -389,10 +390,31 @@ export function createMemStore({ log = console } = {}) {
     }, { staleMs: 10000, timeoutMs: 15000 })
   }
 
+  // 整份覆盖写：先写同目录临时文件并 fsync，再 rename 原子替换。
+  // 以前直接 writeFileSync(原文件)，写一半断电/被杀会把整月分片截断——facts 只有最后一行
+  // 可能是半截 JSON（还能救），但截断是整份；临时文件+改名保证要么是旧文件、要么是新文件。
+  // 残留的 .staging-* 不是 .jsonl 后缀，加载时会被忽略。
+  function writeTextAtomic(file, text) {
+    const staging = `${file}.staging-${process.pid}-${Math.random().toString(36).slice(2, 8)}`
+    const fd = openSync(staging, 'w')
+    try {
+      writeSync(fd, text)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    try {
+      renameSync(staging, file) // 同目录 rename = 原子替换
+    } catch (err) {
+      try { unlinkSync(staging) } catch { /* 清理失败不影响主流程 */ }
+      throw err
+    }
+  }
+
   // 一次性整理 facts 分片：同一个 id 只保留最后一行（旧的命中追加行、坏行清掉）。
-  // 只在启动时跑一次，且只在真发现重复/坏行时才重写；重写本身是整份覆盖，addFact 的 append
-  // 不参与这把锁，所以理论上和别的进程同毫秒追加可能丢一行——启动时撞上的概率极低，
-  // 用紧凑的文件换掉历史堆积更划算。返回 {files,removed}。
+  // 只在启动时跑一次，且只在真发现重复/坏行时才重写；重写走 writeTextAtomic（临时文件+改名），
+  // addFact 的 append 不参与这把锁，理论上和别的进程同毫秒追加可能丢一行——启动时撞上的
+  // 概率极低，用紧凑的文件换掉历史堆积更划算。返回 {files,removed}。
   function compactFacts() {
     return lockAndRun('mem-facts', () => {
       invalidate()
@@ -417,7 +439,7 @@ export function createMemStore({ log = console } = {}) {
           keep.push(lines[i])
         }
         if (keep.length !== lines.length) {
-          writeFileSync(p, keep.length ? keep.join('\n') + '\n' : '')
+          writeTextAtomic(p, keep.length ? keep.join('\n') + '\n' : '')
           files++
         }
       }

@@ -302,6 +302,26 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
     return data && data.messages.length ? data.messages[data.messages.length - 1] : null
   }
 
+  // 按 id 找一条消息（引用用）。支持完整 uuid 或前 8 位缩写，从最新一片往前找。
+  // 只读、不加锁：引用是低频操作，扫几片 JSON 的代价可以接受。
+  function findById(chatId, id) {
+    const want = String(id || '').trim()
+    if (want.length < 6) return null
+    const idx = readIndex(chatId)
+    for (let s = idx.segments.length - 1; s >= 0; s--) {
+      const seg = idx.segments[s]
+      if (!seg.count) continue
+      const data = readSeg(chatId, seg.id)
+      if (!data || !Array.isArray(data.messages)) continue
+      for (let i = data.messages.length - 1; i >= 0; i--) {
+        const m = data.messages[i]
+        const mid = String(m.id || '')
+        if (mid === want || (want.length >= 6 && mid.startsWith(want))) return m
+      }
+    }
+    return null
+  }
+
   function oldestAt(chatId) {
     const idx = readIndex(chatId)
     const seg = idx.segments[0]
@@ -542,7 +562,7 @@ export function createHistory({ log = console, emit = () => {}, getKeepDays = ()
   }
 
   return {
-    append, patchLast, page, pageFile, recent, last, oldestAt, totalOf,
+    append, patchLast, page, pageFile, recent, last, findById, oldestAt, totalOf,
     bytesSince,
     sweep, sweepAll, touch, finalize, splitCurrent, closeAll, stats, reapOrphanMedia,
     saveMedia, mediaPath: mediaFile, mediaDir, chatDir, purgeChat,

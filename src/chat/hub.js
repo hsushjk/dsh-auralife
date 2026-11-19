@@ -53,6 +53,8 @@ export function createHub({
   // flush 到点时按队列顺序回——不能用 setTimeout 重新 enqueue（后一句会插到前一句前面），
   // 也不能丢掉原消息的 wantVoice（语音请求要跟着一起保留）。
   const replyHoldUntil = new Map() // chatId -> 最早可回复的时间戳
+  // 本轮/最近一条入站消息：模型写 <reply/>（不带 id）时，引用「对方刚发的那条」。
+  const lastInbound = new Map() // chatId -> message
   const typingUntil = new Map()
   const busy = new Set()
   const busyTimers = new Map()
@@ -254,6 +256,34 @@ export function createHub({
 
   function deleteChatLog(day) {
     try { unlinkSync(join(chatlogDir(), `${day}.jsonl`)) } catch {}
+  }
+
+  // ——引用（quote）——
+  // 消息上的 quote 只是一份快照：{ id, who, text, at, kind }。display 不依赖原消息还在，
+  // 翻到旧分片里也能看清“在回哪句”；模型侧拿到的是同一份文本。
+  function quoteTextOf(m) {
+    if (!m) return ''
+    if (m.kind === 'voice') return m.heard ? `[语音] ${m.heard}` : String(m.text || '[语音]')
+    if (m.kind === 'image') return '[图片]'
+    if (m.kind === 'sticker') return m.name ? `[表情 ${m.name}]` : '[表情]'
+    if (m.kind === 'file') return `[文件] ${m.fileName || ''}`.trim()
+    return String(m.text || '').slice(0, 300)
+  }
+
+  function quoteOfMessage(m) {
+    if (!m || !m.id) return null
+    const text = quoteTextOf(m)
+    if (!text) return null
+    return { id: String(m.id), who: m.who === 'bot' ? 'bot' : 'user', text, at: Number(m.t) || 0, kind: m.kind || 'text' }
+  }
+
+  function cleanQuote(q) {
+    if (!q || typeof q !== 'object') return null
+    const id = String(q.id || '').trim().slice(0, 80)
+    const text = String(q.text || '').trim().slice(0, 300)
+    if (!id || !text) return null
+    const kind = ['text', 'voice', 'sticker', 'image', 'file'].includes(q.kind) ? q.kind : 'text'
+    return { id, who: q.who === 'bot' ? 'bot' : 'user', text, at: Number(q.at) || 0, kind }
   }
 
   async function appendMessage(chatId, payload) {
@@ -496,61 +526,61 @@ export function createHub({
     return agent
   }
 
-  async function sendText(chatId, text) {
-    await appendMessage(chatId, { who: 'bot', text, kind: 'text' })
+  async function sendText(chatId, text, opts = {}) {
+    await appendMessage(chatId, { who: 'bot', text, kind: 'text', ...(opts.quote ? { quote: opts.quote } : {}) })
     bump('messages')
     return true
   }
 
-  async function sendVoice(chatId, text) {
+  async function sendVoice(chatId, text, opts = {}) {
     try {
       const { file, engine } = await tts.speak(text)
       const b64 = readFileSync(file).toString('base64')
       const voiceMime = String(file).endsWith('.wav') ? 'audio/wav' : 'audio/mpeg'
-      await appendMessage(chatId, { who: 'bot', text, kind: 'voice', voice: b64, voiceMime, engine })
+      await appendMessage(chatId, { who: 'bot', text, kind: 'voice', voice: b64, voiceMime, engine, ...(opts.quote ? { quote: opts.quote } : {}) })
       bump('voice')
       return true
     } catch (e) {
       log.warn('语音没发出去，改发文字：' + e.message)
-      await sendText(chatId, text)
+      await sendText(chatId, text, opts)
       return false
     }
   }
 
-  async function sendSticker(chatId, query) {
+  async function sendSticker(chatId, query, opts = {}) {
     const lib = stickers.library().items
     let item = query && typeof query === 'object' ? query : stickers.match(query)
 
     if (!item && lib.length) item = lib[Math.floor(Math.random() * lib.length)]
     if (!item) { log.debug('表情库是空的，跳过表情'); return false }
 
-    await appendMessage(chatId, { who: 'bot', text: '[表情]', kind: 'sticker', sticker: item.md5, name: item.name || '', caption: item.name || '', mark: 'sticker' })
+    await appendMessage(chatId, { who: 'bot', text: '[表情]', kind: 'sticker', sticker: item.md5, name: item.name || '', caption: item.name || '', mark: 'sticker', ...(opts.quote ? { quote: opts.quote } : {}) })
     try { await stickers.markUsed?.(item.md5) } catch (error) { log.warn('表情使用计数落盘失败：' + (error?.message || error)) }
     bump('stickers')
     return true
   }
 
-  async function sendImage(chatId, src) {
+  async function sendImage(chatId, src, opts = {}) {
     try {
       const buf = Buffer.isBuffer(src) ? src : await fetchImage(src, { maxBytes: 10 * 1024 * 1024 })
       const mime = mimeOf(buf)
       if (mime && mime.startsWith('image/')) {
-        await appendMessage(chatId, { who: 'bot', text: '[图片]', kind: 'image', image: buf.toString('base64'), imageMime: mime, mark: 'ai-image' })
+        await appendMessage(chatId, { who: 'bot', text: '[图片]', kind: 'image', image: buf.toString('base64'), imageMime: mime, mark: 'ai-image', ...(opts.quote ? { quote: opts.quote } : {}) })
         bump('images')
         return true
       }
       // 内容不是图片（模型把文字塞进了 ![]()）：按文本文件发，别让客户端解出一张坏图
-      return sendFile(chatId, buf.toString('utf8'), 'message.txt')
+      return sendFile(chatId, buf.toString('utf8'), 'message.txt', opts)
     } catch (e) { log.warn('图片发不出去：' + e.message); return false }
   }
 
-  async function sendFile(chatId, content, name) {
+  async function sendFile(chatId, content, name, opts = {}) {
     try {
       const text = String(content || '')
       if (!text.trim()) { log.warn('文件内容是空的，不发了'); return false }
       const fileName = String(name || 'message.txt').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || 'message.txt'
       const saved = history.saveMedia(chatId, Buffer.from(text, 'utf8').toString('base64'), 'text/plain')
-      await appendMessage(chatId, { who: 'bot', text: '[文件] ' + fileName, kind: 'file', fileName, fileMime: 'text/plain', mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes: saved.bytes, mark: 'ai-file' })
+      await appendMessage(chatId, { who: 'bot', text: '[文件] ' + fileName, kind: 'file', fileName, fileMime: 'text/plain', mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes: saved.bytes, mark: 'ai-file', ...(opts.quote ? { quote: opts.quote } : {}) })
       bump('files')
       return true
     } catch (e) { log.warn('文件发不出去：' + e.message); return false }
@@ -576,18 +606,28 @@ export function createHub({
     let items = r.items
     if (opts.wantVoice && cfg.voice.enabled && !items.some((i) => i.kind === 'voice')) {
       const spoken = items.filter((i) => i.kind === 'text').map((i) => i.value).join('，')
-      if (spoken && spoken.length <= 300) items = [{ kind: 'voice', value: spoken }, ...items.filter((i) => i.kind !== 'text')]
+      // 转语音时把引用挂到语音条上，别把 <reply/> 弄丢
+      const replying = items.find((i) => i.replyTo)?.replyTo
+      if (spoken && spoken.length <= 300) items = [{ kind: 'voice', value: spoken, ...(replying ? { replyTo: replying } : {}) }, ...items.filter((i) => i.kind !== 'text')]
     }
     const texts = items.filter((i) => i.kind === 'text')
     // 语音/表情不再随机Ta 想用语音就自己在回复里写 <voice>，想发表情就写 <sticker>，
     // 或用户要求语音（opts.wantVoice）。概率抽签对数字生命是机械行为，已删。
     for (let i = 0; i < items.length; i++) {
       const it = items[i]
-      if (it.kind === 'text') await sendText(chatId, it.value)
-      else if (it.kind === 'voice') { if (cfg.voice.enabled) await sendVoice(chatId, it.value); else await sendText(chatId, it.value) }
-      else if (it.kind === 'sticker') await sendSticker(chatId, it.value)
-      else if (it.kind === 'image') await sendImage(chatId, it.value)
-      else if (it.kind === 'file') await sendFile(chatId, it.value, it.name)
+      // <reply/>：引用对方刚发的那条；<reply:id>：按 id（支持前 8 位）找历史消息
+      let quoted = null
+      if (it.replyTo) {
+        const target = it.replyTo === 'auto' ? lastInbound.get(chatId) : history.findById(chatId, it.replyTo)
+        quoted = target ? quoteOfMessage(target) : null
+        if (!quoted) log.debug?.(`${chatId}：引用目标 ${it.replyTo} 没找到，忽略`)
+      }
+      const withQuote = quoted ? { quote: quoted } : {}
+      if (it.kind === 'text') await sendText(chatId, it.value, withQuote)
+      else if (it.kind === 'voice') { if (cfg.voice.enabled) await sendVoice(chatId, it.value, withQuote); else await sendText(chatId, it.value, withQuote) }
+      else if (it.kind === 'sticker') await sendSticker(chatId, it.value, withQuote)
+      else if (it.kind === 'image') await sendImage(chatId, it.value, withQuote)
+      else if (it.kind === 'file') await sendFile(chatId, it.value, it.name, withQuote)
       if (i < items.length - 1) {
         // B：这里必须是延时函数，不是睡眠器官 getter。顺手记实际间隔，出问题能当场看到。
         const gap = bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay
@@ -694,30 +734,38 @@ export function createHub({
 
   const fmtB = (n) => (n < 1024 ? n + ' B' : (n < 1024 * 1024 ? (n / 1024).toFixed(1) + ' KB' : (n / 1024 / 1024).toFixed(1) + ' MB'))
 
-  async function onUserMessage({ chatId, userId, nickname, text = '', images = [], files = [], voice = null, sticker = '', level = '' }) {
+  async function onUserMessage({ chatId, userId, nickname, text = '', images = [], files = [], voice = null, sticker = '', level = '', quote = null }) {
     const cfg = getConfig()
+    const quoted = cleanQuote(quote)
     const wantVoice = Boolean(voice && voice.data)
     typingUntil.delete(chatId)
     let userSticker = null
     const chat = { chatId, userId, nickname: nickname || userId, ...(level ? { level } : {}) }
     if (voice && voice.data) {
-      await appendMessage(chatId, { who: 'user', uid: userId, text: `[语音 · ${Math.round(voice.dur || 0)}秒]`, kind: 'voice', voice: voice.data, voiceMime: voice.mime || 'audio/webm', dur: Math.round(voice.dur || 0) })
+      const m = await appendMessage(chatId, { who: 'user', uid: userId, text: `[语音 · ${Math.round(voice.dur || 0)}秒]`, kind: 'voice', voice: voice.data, voiceMime: voice.mime || 'audio/webm', dur: Math.round(voice.dur || 0), ...(quoted ? { quote: quoted } : {}) })
+      if (m) lastInbound.set(chatId, m)
       logChat(chatId, nickname || userId, '[语音]', userId)
       bump('voice')
     } else if (sticker) {
       const item = stickers.library().items.find((i) => i.md5 === sticker) || null
       userSticker = item
-      await appendMessage(chatId, { who: 'user', uid: userId, text: '[表情]', kind: 'sticker', sticker, name: item?.name || '', mark: 'user-sticker' })
+      const m = await appendMessage(chatId, { who: 'user', uid: userId, text: '[表情]', kind: 'sticker', sticker, name: item?.name || '', mark: 'user-sticker', ...(quoted ? { quote: quoted } : {}) })
+      if (m) lastInbound.set(chatId, m)
       logChat(chatId, nickname || userId, `[表情${item?.name ? ' ' + item.name : ''}]`, userId)
       bump('sticker')
     } else if (text) {
-      await appendMessage(chatId, { who: 'user', uid: userId, text, kind: 'text' })
+      const m = await appendMessage(chatId, { who: 'user', uid: userId, text, kind: 'text', ...(quoted ? { quote: quoted } : {}) })
+      if (m) lastInbound.set(chatId, m)
       logChat(chatId, nickname || userId, text, userId)
     }
     lastChatAt = Date.now()
     if (isOwner(cfg, userId)) lastOwnerChatAt = Date.now()
     onActivity?.({ kind: 'in', chatId, text: text || '[语音]', userId, nickname })
     const content = []
+    // 引用要放进模型能看到的上下文里：否则她只看到对方这句，不知道自己被“引用”的那句是什么。
+    if (quoted) {
+      content.push({ type: 'text', text: `【对方引用了一条消息${quoted.who === 'bot' ? '（你之前说的）' : ''}（id=${quoted.id.slice(0, 8)}）：「${quoted.text}」】` })
+    }
     // 语音转录结果要留给下面的「睡着先记着」分支：以前 heard 只在 if 块里活着，
     // pendingReply 只能拿到「[语音]」占位符，醒来补回时模型不知道对方说了什么。
     let voiceHeard = ''
@@ -759,7 +807,8 @@ export function createHub({
     }
     for (const img of images) {
       content.push({ type: 'image', data: img.data, mediaType: img.mediaType || 'image/png', name: img.name || 'image' })
-      await appendMessage(chatId, { who: 'user', uid: userId, text: '[图片]', kind: 'image', image: img.data, imageMime: img.mediaType || 'image/png', mark: 'user-image' })
+      const m = await appendMessage(chatId, { who: 'user', uid: userId, text: '[图片]', kind: 'image', image: img.data, imageMime: img.mediaType || 'image/png', mark: 'user-image' })
+      if (m) lastInbound.set(chatId, m)
       logChat(chatId, nickname || userId, '[图片]', userId)
 
       if (cfg.stickers?.steal !== false && stickers?.addFromBuffer) {
@@ -780,7 +829,8 @@ export function createHub({
       let saved = null
       try { saved = history.saveMedia(chatId, f.data, mime) } catch (err) { log.warn('存文件失败：' + err.message) }
       const bytes = saved ? saved.bytes : raw.length
-      await appendMessage(chatId, { who: 'user', uid: userId, text: '[文件] ' + name, kind: 'file', fileName: name, fileMime: mime, ...(saved ? { mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes } : {}) })
+      const m = await appendMessage(chatId, { who: 'user', uid: userId, text: '[文件] ' + name, kind: 'file', fileName: name, fileMime: mime, ...(saved ? { mediaId: saved.mediaId, mediaMime: saved.mediaMime, bytes } : {}) })
+      if (m) lastInbound.set(chatId, m)
       logChat(chatId, nickname || userId, '[文件] ' + name, userId)
       bump('files')
       // 文本类文件：读出内容给 Ta 看（cap 4000 字）；二进制：只告知收到
@@ -804,7 +854,9 @@ export function createHub({
         // 落盘只会把上一条还没补的主人消息挤掉——别记，直接算了。
         if (chatId === OWNER_ID) {
           // 语音：带上转录（没有转录才退回占位符），醒来 catchup 才补得对。
-          const seen = text || (voiceHeard ? `[语音] ${voiceHeard}` : voice ? '[语音]' : sticker ? '[表情]' : '[消息]')
+          // 引用了谁也要写进去，不然补回时只看到“回我一句”，不知道在回哪条。
+          const quotedPrefix = quoted ? `[引用「${quoted.text.slice(0, 40)}」] ` : ''
+          const seen = quotedPrefix + (text || (voiceHeard ? `[语音] ${voiceHeard}` : voice ? '[语音]' : sticker ? '[表情]' : '[消息]'))
           pendingReply = { chatId, at: Date.now(), text: seen, userId, level, ...(voiceHeard ? { heard: voiceHeard } : {}) }
           persistPendingReply(pendingReply)
         }

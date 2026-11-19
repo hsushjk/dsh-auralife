@@ -1,3 +1,13 @@
+// 引用快照只带显示需要的字段；服务端再清洗一遍，前端传坏了也不至于把脏数据写进历史。
+function cleanQuote(q) {
+  if (!q || typeof q !== 'object') return null
+  const id = String(q.id || '').trim().slice(0, 80)
+  const text = String(q.text || '').trim().slice(0, 300)
+  if (!id || !text) return null
+  const kind = ['text', 'voice', 'sticker', 'image', 'file'].includes(q.kind) ? q.kind : 'text'
+  return { id, who: q.who === 'bot' ? 'bot' : 'user', text, at: Math.round(Number(q.at) || 0), kind }
+}
+
 export function register(router, ctx) {
   const { json, readBody, stripDataUrl, requireUser, chatIdOf, displayNameOf, log } = ctx
   const { hub } = ctx.deps
@@ -57,10 +67,11 @@ export function register(router, ctx) {
     }
     const voice = b.voice && b.voice.data ? { data: stripDataUrl(b.voice.data), mime: b.voice.mime || 'audio/webm', dur: Math.min(60, Math.max(1, Number(b.voice.dur) || 1)) } : null
     const sticker = String(b.sticker || '').trim()
+    const quote = cleanQuote(b.quote)
     if (!text && images.length === 0 && files.length === 0 && !voice && !sticker) return json(res, { ok: false, reason: '没说啥' })
     // 文件发送链路探针（排查「选了文件没弹窗」）：确认前端有没有把请求送过来
     if (files.length || images.length) log.info('[messages] 收到 ' + (files.length ? files.length + ' 个文件' : '') + (files.length && images.length ? ' + ' : '') + (images.length ? images.length + ' 张图' : ''))
-    hub.onUserMessage({ chatId: chatIdOf(me.subject), userId: me.subject, nickname: displayNameOf(me.subject), text, images, files, voice, sticker, level: me.level }).catch((e) => log.warn('收消息出错：' + e.message))
+    hub.onUserMessage({ chatId: chatIdOf(me.subject), userId: me.subject, nickname: displayNameOf(me.subject), text, images, files, voice, sticker, level: me.level, quote }).catch((e) => log.warn('收消息出错：' + e.message))
     return json(res, { ok: true })
   })
 
@@ -71,7 +82,7 @@ export function register(router, ctx) {
     const dur = Number(b.dur) || 0
     if (!data) return json(res, { ok: false, reason: '没有音频数据' })
     if (dur < 1 || dur > 60) return json(res, { ok: false, reason: '语音条要 1 到 60 秒' })
-    hub.onUserMessage({ chatId: chatIdOf(me.subject), userId: me.subject, nickname: displayNameOf(me.subject), text: '', voice: { data, mime: b.mime || 'audio/webm', dur }, level: me.level }).catch((e) => log.warn('收语音出错：' + e.message))
+    hub.onUserMessage({ chatId: chatIdOf(me.subject), userId: me.subject, nickname: displayNameOf(me.subject), text: '', voice: { data, mime: b.mime || 'audio/webm', dur }, level: me.level, quote: cleanQuote(b.quote) }).catch((e) => log.warn('收语音出错：' + e.message))
     return json(res, { ok: true })
   })
 

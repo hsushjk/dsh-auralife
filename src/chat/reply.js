@@ -1,5 +1,6 @@
 // ——回复解析：把模型输出拆成聊天消息项（AuraLife 自己的实现，2026-11 重写）——// 模型回复协议：<voice>…</voice> 语音、<sticker:标签> 表情、<poke/> 拍一拍、
-// <reply:N> 引用（挂到下一条气泡）、![](url) 图片、<file:文件名>…</file> 发文件、||| 分隔多条气泡。
+// <reply/> 引用对方刚发的那条、<reply:消息id> 引用指定消息（都挂到紧随其后的气泡上）、
+// ![](url) 图片、<file:文件名>…</file> 发文件、||| 分隔多条气泡。
 // 输出统一成 { kind: 'text'|'voice'|'sticker'|'image'|'file'|'poke', value, replyTo? }[]。
 
 const SILENCE = '[沉默]'
@@ -76,7 +77,7 @@ function foldTextItems(items) {
 }
 
 // ——回复内嵌标记扫描：一次正则找出下一个标记，按标记类型产出消息项 ——
-const MARKER_RE = /<poke\s*\/?>|<reply:\s*(\d+)\s*>|<voice>([\s\S]*?)<\/voice>|<sticker:([^>]+?)>(?:\s*<\/sticker>)?|<file:([^>]+?)>([\s\S]*?)<\/file>|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g
+const MARKER_RE = /<poke\s*\/?>|<reply(?::\s*([A-Za-z0-9_-]+))?\s*\/?>|<voice>([\s\S]*?)<\/voice>|<sticker:([^>]+?)>(?:\s*<\/sticker>)?|<file:([^>]+?)>([\s\S]*?)<\/file>|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g
 
 // 纯文本段落（可能是好几行），拆成可独立发送的消息项，同时过滤「模型自我规划」碎语
 const PLANNER_PREFIXES = /^(回复|答|接着回|然后(再)?加|不过要注意|这里第)/
@@ -93,7 +94,7 @@ function lineWorthKeeping(line) {
 }
 
 // 残留的协议标签（未配对成功时）不该出现在聊天正文里。
-const STRAY_TAG_RE = /<voice>|<\/voice>|<file:[^<>]*>|<\/file>|<sticker:[^<>]*>|<\/sticker>|<poke\s*\/?>/gi
+const STRAY_TAG_RE = /<reply[^>]*>|<voice>|<\/voice>|<file:[^<>]*>|<\/file>|<sticker:[^<>]*>|<\/sticker>|<poke\s*\/?>/gi
 
 function stripStrayTags(text) {
   return String(text || '').replace(STRAY_TAG_RE, '')
@@ -150,8 +151,9 @@ export function parseReply(text) {
       const marker = match[0]
       if (marker.startsWith('<poke')) {
         if (!items.some((item) => item.kind === 'poke')) items.push({ kind: 'poke', value: '' })
-      } else if (match[1] !== undefined) {
-        pendingReplyId = match[1]
+      } else if (marker.startsWith('<reply')) {
+        // <reply/> 让 hub 去解析“对方刚发的那条”；<reply:id> 用消息 id（支持前 8 位缩写）
+        pendingReplyId = match[1] || 'auto'
       } else if (match[2] !== undefined) {
         const spoken = stripMarkdown(match[2])
         if (spoken) items.push({ kind: 'voice', value: spoken })
@@ -186,7 +188,7 @@ export function parseReply(text) {
 
   for (const bubble of raw.split('|||')) handleBubble(bubble)
 
-  // 只有第一条 <reply:N> 生效，多出来的删掉
+  // 只有第一条 <reply…> 生效，多出来的删掉
   let used = false
   for (const item of items) {
     if (!item.replyTo) continue
