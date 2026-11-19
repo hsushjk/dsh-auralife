@@ -11,7 +11,7 @@ import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
 import { createPromptSink } from '../core/prompt-sink.js'
 import { quoteOfMessage, resolveQuote } from './quote.js'
-import { initTurnText, rememberTurnText, takeTurnText, claimTurnRefund } from './turn-text.js'
+import { initTurnText, rememberTurnText, takeTurnText, chargeTurn, settleTurnCharge, markSettledTurn } from './turn-text.js'
 
 const WORKSPACE_DIR = process.env.AURALIFE_WORKSPACE || join(homedir(), 'AuraLife', 'chats')
 const WORKSPACE_TITLE = 'AuraLife · Web'
@@ -659,11 +659,15 @@ export function createHub({
 
   // 体力按轮扣：turn/start 时一次（工具调用再多也不重复），沉默/空轮在 turn/end 退一半。
   // 只对映射到聊天的会话生效，别的 DSH 会话（比如别的工作区 agent）不耗她的体力。
-  function spendTurnEnergy() {
+  function spendTurnEnergy(st, turn) {
+    const energy = energyOf()
+    if (!energy?.spendTurn) return false
+    if (!chargeTurn(st, turn)) return false
     try {
-      const p = energyOf()?.spendTurn?.()
+      const p = energy.spendTurn()
       if (p && typeof p.catch === 'function') p.catch((e) => log.warn('体力消耗失败：' + (e?.message || e)))
     } catch (e) { log.warn('体力消耗失败：' + (e?.message || e)) }
+    return true
   }
 
   function refundTurnEnergy() {
@@ -673,29 +677,18 @@ export function createHub({
     } catch (e) { log.warn('体力退回失败：' + (e?.message || e)) }
   }
 
-  // 同一轮只退一次：重复的 turn/end 会落进「空轮退款」，不退重就白退一份。
-  function refundTurnEnergyOnce(st, turn) {
-    if (!claimTurnRefund(st, turn)) {
-      log.debug?.(`轮 ${turn} 的体力已经退过，忽略重复的退款`)
-      return false
-    }
-    refundTurnEnergy()
-    return true
-  }
-
   function onSessionEvent(session, event) {
     const key = sessionKey(session && session.id)
     const chatId = sessionToChat.get(key)
     if (!chatId || !event) return
-    const st = turnState.get(key) || { lastTurn: -1, spentTurn: -1, text: '', senders: new Set(), turnText: initTurnText() }
+    const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set(), turnText: initTurnText() }
     turnState.set(key, st)
     if (event.type === 'turn/start') {
       const turn = Number((event.data || {}).turn)
-      // 同一轮的 turn/start 只扣一次；没有 turn 号（旧格式）时才按事件各扣一次。
-      if (!Number.isFinite(turn) || turn !== st.spentTurn) {
-        if (Number.isFinite(turn)) st.spentTurn = turn
-        spendTurnEnergy()
-      }
+      const hasTurn = Number.isFinite(turn)
+      if (hasTurn) st.currentTurn = turn
+      // 同一轮的 turn/start 只扣一次；没有 turn 号（旧格式）时按事件各记一次。
+      spendTurnEnergy(st, hasTurn ? turn : null)
       return
     }
     if (event.type === 'assistant/message') {
@@ -722,6 +715,14 @@ export function createHub({
     if (event.type === 'turn/end') {
       stopTyping(chatId)
       const d = event.data || {}
+      const turn = Number(d.turn)
+      const hasTurn = Number.isFinite(turn)
+      if (hasTurn && !markSettledTurn(st, turn)) {
+        log.debug?.(`${chatId} 重复的 turn/end（轮 ${turn}）已忽略`)
+        return
+      }
+      // 这一轮的扣费在 turn/end 结清：退不退都只可能结一次；没扣过费的轮不退（防白退）。
+      const charged = settleTurnCharge(st, hasTurn ? turn : null)
       const completed = d.reason && d.reason.kind === 'completed'
       // 按轮号取：晚到/乱序的 turn/end 也能拿到自己那一轮的文本，不会把有空轮的判成空轮。
       const byTurn = takeTurnText(st.turnText, d.turn)
@@ -737,23 +738,32 @@ export function createHub({
       st.systemTimedOut = false
       st.wantVoice = false
       // 超时的那一轮晚到的 turn/end：system 已被超时回调清空，直接丢弃，不能走正常发货分支。
-      if (sysTimedOut) { log.debug?.(`${chatId}：超时轮次晚到的 turn/end 已忽略`); return }
+      if (sysTimedOut) {
+        // 超时回调已经退过；这里兜底只处理「回调没拿到轮号、晚到的这一轮才有 charge」的情况。
+        if (charged) refundTurnEnergy()
+        log.debug?.(`${chatId}：超时轮次晚到的 turn/end 已忽略`)
+        return
+      }
       if (sys) {
         if (completed) sys.resolve(text)
-        else sys.reject(new Error('这一轮没正常结束：' + (d.reason?.kind || '?')))
+        else {
+          // 系统轮（主动开口、空间互动、日记等）超时或中断同样按空轮退一半。
+          if (charged) refundTurnEnergy()
+          sys.reject(new Error('这一轮没正常结束：' + (d.reason?.kind || '?')))
+        }
         return
       }
       if (!completed) {
         // 中断的轮也不该按干满一轮算：没发出去就算空轮，退一半。
-        refundTurnEnergyOnce(st, d.turn)
+        if (charged) refundTurnEnergy()
         log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}），不发，按空轮退一半体力`)
         release(chatId)
         return
       }
-      if (!text) { refundTurnEnergyOnce(st, d.turn); wakeWindowDone().catch(() => {}); return release(chatId) }
+      if (!text) { if (charged) refundTurnEnergy(); wakeWindowDone().catch(() => {}); return release(chatId) }
       deliver(chatId, text, { wantVoice, userText: lastText })
         // 沉默轮/一个气泡都没发出去的轮：退一半体力（不想说话不该按干了一轮活算）。
-        .then((info) => { if (info && (info.silent || info.sent === 0)) refundTurnEnergyOnce(st, d.turn) })
+        .then((info) => { if (charged && info && (info.silent || info.sent === 0)) refundTurnEnergy() })
         .catch((e) => log.warn('发送出错：' + e.message))
         .finally(() => release(chatId))
     }
@@ -1103,9 +1113,10 @@ export function createHub({
     const timeoutMs = opts.timeoutMs || 180000
     return new Promise(async (resolve, reject) => {
       let timer
+      let key = ''
       try {
         const agent = await agentFor(chat)
-        const key = sessionKey(agent.session?.id)
+        key = sessionKey(agent.session?.id)
         let st = turnState.get(key)
         if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), turnText: initTurnText() }; turnState.set(key, st) }
         st.system = { resolve, reject }
@@ -1117,6 +1128,9 @@ export function createHub({
             // 标记超时：这一轮的 turn/end 晚到时不能再落进「正常发货」分支，
             // 否则 system:diary 这类虚拟会话会真的往会话里发气泡。
             s.systemTimedOut = true
+            // 超时的系统轮没干完活，按空轮退一半；标记已结束，晚到的 turn/end 不会再退一次。
+            const turn = Number.isFinite(Number(s.currentTurn)) ? Number(s.currentTurn) : null
+            if (turn !== null && markSettledTurn(s, turn) && settleTurnCharge(s, turn)) refundTurnEnergy()
             reject(new Error('这一轮超时了'))
           }
         }, timeoutMs)
@@ -1135,6 +1149,15 @@ export function createHub({
         await dsh.sessions.flush(agent.session)
       } catch (e) {
         if (timer) clearTimeout(timer)
+        // 发起/交付失败：这一轮同样没干完，退一半（只对真扣过费的轮生效）。
+        const s = key ? turnState.get(key) : null
+        if (s) {
+          s.system = null
+          s.sysTimer = null
+          s.systemTimedOut = false
+          const turn = Number.isFinite(Number(s.currentTurn)) ? Number(s.currentTurn) : null
+          if (turn !== null && markSettledTurn(s, turn) && settleTurnCharge(s, turn)) refundTurnEnergy()
+        }
         reject(e)
       }
     })
