@@ -9,6 +9,8 @@ const KEEP = 12
 const KEEP_LEDGER = 24
 // 没有轮号的旧格式无法精确配对：只留最近几笔，并在 30 分钟后作废。
 // 插件 dispose、进程被杀留下的残值不能无限期保留，否则下一个真实 turn/end 会把它捡走白退一半。
+// 代价是跑超 30 分钟的无轮号轮会一起被当残值清掉（那一轮扣满不退）；
+// 这是有意的保守方向：宁可少退，也不给后来的 turn/end 白退的机会。
 const PENDING_TTL_MS = 30 * 60_000
 const PENDING_MAX = 4
 

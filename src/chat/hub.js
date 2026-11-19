@@ -60,6 +60,8 @@ export function createHub({
   const typingUntil = new Map()
   const busy = new Set()
   const busyTimers = new Map()
+  // 哪个轮号占着 busy：重复的 turn/end 只放开自己那一轮，别误放掉刚开的下一轮。
+  const busyTurn = new Map()
   const waiting = new Set()
   const usageCache = new Map() // chatId -> { t, tokens, window, ratio }
   const usageReal = new Map() // chatId -> { t, used }（平台 assistant/message.usage 报的真实 token）
@@ -692,7 +694,11 @@ export function createHub({
     if (event.type === 'turn/start') {
       const turn = Number((event.data || {}).turn)
       const hasTurn = Number.isFinite(turn)
-      if (hasTurn) st.currentTurn = turn
+      if (hasTurn) {
+        st.currentTurn = turn
+        // 这个轮号正占着这个聊天的 busy，供重复 turn/end 判断「该不该放开」。
+        if (busy.has(chatId)) busyTurn.set(chatId, turn)
+      }
       // 同一轮的 turn/start 只扣一次；没有 turn 号（旧格式）时按事件各记一次。
       spendTurnEnergy(st, hasTurn ? turn : null)
       return
@@ -725,6 +731,9 @@ export function createHub({
       const hasTurn = Number.isFinite(turn)
       if (hasTurn && !markSettledTurn(turnLedger(st), turn)) {
         log.debug?.(`${chatId} 重复的 turn/end（轮 ${turn}）已忽略`)
+        // 重复事件也不能把 busy 留到 5 分钟兜底：只放开「这一轮自己占着的」，
+        // 如果已经开了下一轮（busyTurn 是别的轮号），就不能动。
+        if (busy.has(chatId) && busyTurn.get(chatId) === turn) release(chatId)
         return
       }
       // 这一轮的扣费在 turn/end 结清：退不退都只可能结一次；没扣过费的轮不退（防白退）。
@@ -1025,6 +1034,7 @@ export function createHub({
 
   function markBusy(chatId) {
     busy.add(chatId)
+    busyTurn.delete(chatId)
     const t = setTimeout(() => {
       if (busy.delete(chatId)) { log.warn(`${chatId} 一轮超过 ${BUSY_MAX_MS / 60000} 分钟，强制放开`); release(chatId) }
     }, BUSY_MAX_MS)
@@ -1060,6 +1070,7 @@ export function createHub({
   function release(chatId) {
     stopTyping(chatId) // B7：超时强制放开时也别让「正在输入」挂着
     busy.delete(chatId)
+    busyTurn.delete(chatId)
     const t = busyTimers.get(chatId)
     if (t) { clearTimeout(t); busyTimers.delete(chatId) }
     if (waiting.has(chatId)) { waiting.delete(chatId); flush(chatId) }
