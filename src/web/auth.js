@@ -86,7 +86,8 @@ export async function issueSession(account) {
     s[token] = {
       subject: account.subject,
       role: account.role,
-      level: account.level || (account.role === 'owner' ? 'full' : 'social'),
+      // full 只属于主人本人；客人登录一律 social（旧数据里的 full 也不上传）。
+      level: account.role === 'owner' ? 'full' : 'social',
       at: Date.now(),
     }
   })
@@ -125,7 +126,8 @@ export function listGuests() {
     username: g.username,
     displayName: g.displayName,
     note: g.note,
-    level: g.level || 'social',
+    // 客人只有一档；旧数据里的 full 显示成 social，下次保存时顺手迁移。
+    level: 'social',
   }))
 }
 
@@ -174,9 +176,9 @@ async function syncSessionLevels(subject, level) {
   })
 }
 
-export async function updateGuest(subject, { displayName, note, username, password, level, confirm } = {}) {
-  // #4：给客人开完全权限要二次确认（前端 confirm 后带 confirm:true），防误点一键开总闸。
-  if (level === 'full' && confirm !== true) return { ok: false, reason: '给客人完全权限需要二次确认' }
+export async function updateGuest(subject, { displayName, note, username, password, level } = {}) {
+  // #4/#44：客人只有「只聊天和空间」一档，full 只属于主人本人，不再接受把客人设成 full。
+  if (level !== undefined && level !== 'social') return { ok: false, reason: '客人只有「只聊天和空间」这一档，完全权限已取消' }
   if (password && String(password).length < 6) return { ok: false, reason: '密码至少 6 位' }
   // #8：改客人资料/权限也是整份写，进锁；会话 level 在锁外同步（另一把锁）。
   const out = await updateUsers((u) => {
@@ -185,14 +187,15 @@ export async function updateGuest(subject, { displayName, note, username, passwo
     if (displayName !== undefined) g.displayName = String(displayName)
     if (note !== undefined) g.note = String(note)
     if (username !== undefined && username !== '') g.username = String(username)
-    if (level === 'full' || level === 'social') g.level = level
+    // 客人档位固定 social；顺手把旧数据里的 full 迁过来。
+    g.level = 'social'
     if (password) {
       g.salt = randomBytes(16).toString('hex')
       g.hash = hashPassword(password, g.salt)
     }
     return { ok: true, level: g.level }
   })
-  if (out.ok && (level === 'full' || level === 'social')) {
+  if (out.ok && level === 'social') {
     try {
       await syncSessionLevels(subject, out.level)
     } catch (error) {

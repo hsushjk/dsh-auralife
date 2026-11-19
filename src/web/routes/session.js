@@ -19,7 +19,7 @@ export function register(router, ctx) {
     return json(res, {
       ok: true,
       needSetup: needSetup(),
-      me: me ? { subject: me.subject, role: me.role, name: displayNameOf(me.subject), level: me.level || (me.role === 'owner' ? 'full' : 'social') } : null,
+      me: me ? { subject: me.subject, role: me.role, name: displayNameOf(me.subject), level: me.role === 'owner' ? 'full' : 'social' } : null,
       botName: (identity?.name || cfg.botName) || 'AuraLife',
       title: cfg.pageTitle || 'AuraLife',
       siteName: cfg.siteName || 'AuraLife',

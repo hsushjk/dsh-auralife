@@ -1856,7 +1856,7 @@ function sectionGuests() {
     '<div class="row"><label>创建客人</label><div class="ctl">' +
     '<input type="text" id="g-u" placeholder="用户名（区分大小写）" style="max-width:190px" />' +
     '<input type="text" id="g-d" placeholder="称呼" style="max-width:100px" />' +
-    '<select id="g-level"><option value="social">只聊天和空间</option><option value="full">完全权限</option></select>' +
+    '<select id="g-level"><option value="social">只聊天和空间</option></select>' +
     '<button class="primary small" id="g-create">创建</button></div></div>' +
     '<div id="guest-list"></div></div></div>'
 }
@@ -2187,16 +2187,9 @@ async function loadGuests() {
   if (create) create.onclick = async () => {
     const username = ($('#g-u')?.value || '').trim()
     if (!username) return toast('先填个用户名', 'err')
-    // 默认只聊天；完全权限是建好之后主人手动点开的白名单（#44）。
-    const wantLevel = $('#g-level')?.value || 'social'
-    if (wantLevel === 'full' && !(await askConfirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？（也可以先建好，再单独点开）'))) return
-    const r2 = await api('/api/guests', { method: 'POST', body: { username, displayName: ($('#g-d')?.value || '').trim() || username, level: 'social' } })
+    // 客人只有「只聊天和空间」一档（full 只属于主人本人，#4/#44）。
+    const r2 = await api('/api/guests', { method: 'POST', body: { username, displayName: ($('#g-d')?.value || '').trim() || username } })
     if (r2.ok) {
-      if (wantLevel === 'full') {
-        const r3 = await api('/api/guests/' + r2.subject, { method: 'PATCH', body: { level: 'full', confirm: true } })
-        if (!r3.ok) toast('客人建好了，但完全权限没开成：' + (r3.reason || ''), 'err')
-        else if (r3.warning) toast(r3.warning, 'err')
-      }
       toast('创建好了，一次性密码：' + r2.password)
       if (navigator.clipboard) navigator.clipboard.writeText(r2.password).catch(() => {})
       if ($('#g-u')) $('#g-u').value = ''
@@ -2210,7 +2203,7 @@ async function loadGuests() {
   box.innerHTML = list.map((g) => '<div class="guest-row"><span class="g-name">' + esc(g.displayName || g.username) + '</span>' +
     '<span class="muted" style="font-size:12px">@' + esc(g.username) + '</span>' +
     '<span class="spacer"></span>' +
-    '<select data-glevel="' + esc(g.subject) + '"><option value="social"' + (g.level === 'social' ? ' selected' : '') + '>只聊天和空间</option><option value="full"' + (g.level === 'full' ? ' selected' : '') + '>完全权限</option></select>' +
+    '<span class="muted" style="font-size:12px">只聊天和空间</span>' +
     '<button class="ghost small" data-gpw="' + esc(g.subject) + '">重置密码</button>' +
     '<button class="danger small" data-gdel="' + esc(g.subject) + '">删除</button></div>').join('')
   box.onclick = async (e) => {
@@ -2228,16 +2221,6 @@ async function loadGuests() {
       const r2 = await api('/api/guests/' + gd.dataset.gdel, { method: 'DELETE' })
       toast(r2.ok ? '删了' : (r2.reason || '没删掉'), r2.ok ? '' : 'err'); loadGuests()
     }
-  }
-  box.onchange = async (e) => {
-    const sel = e.target.closest('[data-glevel]')
-    if (!sel) return
-    // 完全权限要二次确认；取消就恢复原值（#44）。
-    if (sel.value === 'full' && !(await askConfirm('完全权限会让她能改人格、写记忆、替你发消息。确定给这个客人开吗？'))) { sel.value = 'social'; return }
-    const r2 = await api('/api/guests/' + sel.dataset.glevel, { method: 'PATCH', body: { level: sel.value, confirm: true } })
-    if (r2.ok && r2.warning) toast(r2.warning, 'err')
-    else toast(r2.ok ? '改好了' : (r2.reason || '没改成'), r2.ok ? '' : 'err')
-    if (!r2.ok || r2.warning) loadGuests()
   }
 }
 

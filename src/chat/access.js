@@ -2,13 +2,8 @@ export const OWNER_ID = 'owner'
 
 export function levelFor(cfg, chat) {
   if (!chat || chat.system) return 'social'
-  if (isOwner(cfg, chat.userId)) return 'full'
-  if (chat.level === 'full') return 'full'
-  return 'social'
-}
-
-export function presetFor(level) {
-  return level === 'full' ? 'auralife-owner' : 'auralife-guest'
+  // full 只属于主人本人；客人即使旧数据里还记着 level='full'，也只按 social 算。
+  return isOwner(cfg, chat.userId) ? 'full' : 'social'
 }
 
 // #4：预设人格只跟「是不是主人本人」走，不跟 level 走。
