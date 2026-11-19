@@ -11,9 +11,11 @@ export function register(router, ctx) {
   router.add('POST', 'api/diary/comment', async (req, res) => {
     const me = requireUser(req, res); if (!me) return
     const b = await readBody(req)
-    const r = azone.addComment(b.entryId, { from: me.subject, name: displayNameOf(me.subject), text: String(b.text || '').trim() })
+    // 这里必须 await：addComment 返回 Promise，不 await 时 json() 会把 Promise 序列化成 {}，
+    // 前端拿不到 ok 就喊「没发出去」，其实留言已经写进去了。
+    const r = await azone.addComment(b.entryId, { from: me.subject, name: displayNameOf(me.subject), text: String(b.text || '').trim() })
     azoneSocial.run({ force: true }).catch((e) => log.warn('回访留言出错：' + e.message))
-    return json(res, r || { ok: true })
+    return json(res, r && r.ok === false ? { ...r, reason: r.message || '没发出去' } : (r || { ok: true }))
   })
 
   // 删除端点已移除（m11672）：日记和留言都不允许手动删——Ta 的空间归 Ta 自己管。
@@ -21,9 +23,9 @@ export function register(router, ctx) {
   router.add('POST', 'api/diary/reply', async (req, res) => {
     const me = requireUser(req, res); if (!me) return
     const b = await readBody(req)
-    const r = azone.addReply(b.entryId, b.commentId, { from: me.subject, name: displayNameOf(me.subject), text: String(b.text || '').trim() })
+    const r = await azone.addReply(b.entryId, b.commentId, { from: me.subject, name: displayNameOf(me.subject), text: String(b.text || '').trim() })
     azoneSocial.run({ force: true }).catch((e) => log.warn('回访留言出错：' + e.message))
-    return json(res, r || { ok: true })
+    return json(res, r && r.ok === false ? { ...r, reason: r.message || '没发出去' } : (r || { ok: true }))
   })
 
   router.add('POST', 'api/diary/run', async (req, res) => {

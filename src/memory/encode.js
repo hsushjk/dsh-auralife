@@ -49,11 +49,20 @@ export function peopleOf(msgs) {
   return [...count.entries()].sort((a, b) => b[1] - a[1]).map(([uid]) => uid)
 }
 
-function lineOf(m, names = {}) {
-  if (m.who === 'bot') return '我：' + (m.text || '')
+// 消息正文：语音消息的 text 只有「[语音 · 2秒]」占位符，真正说的是 heard（转录）。
+// text 空或是语音占位符时回落到 heard，并标明来源，免得事件摘要写成「只收到语音、没有内容」。
+function saidOf(m) {
+  const text = String(m?.text ?? '')
+  const heard = String(m?.heard ?? '').trim()
+  if (heard && (!text || text.startsWith('[语音'))) return `[语音转写] ${heard}`
+  return text
+}
+
+export function lineOf(m, names = {}) {
+  if (m.who === 'bot') return '我：' + saidOf(m)
   const uid = m.uid || m.who || ''
   const label = names[uid] ? `${names[uid]}(${uid})` : (uid ? `${m.who}(${uid})` : m.who)
-  return `${label}：${m.text || ''}`
+  return `${label}：${saidOf(m)}`
 }
 
 function parseArr(out) {
@@ -224,9 +233,9 @@ export function createEncode({ dsh, getConfig, store, log = console }) {
   }
 
   // 把一个 chatId 的一段原文消息编码成 episode + facts。
-  // msgs: [{ id, t, who, uid, text }]（升序）
+  // msgs: [{ id, t, who, uid, text, heard? }]（升序；语音消息的正文在 heard）
   async function encodeSegment(chatId, msgs, { names = {} } = {}) {
-    const talk = (msgs || []).filter((m) => m.text && !String(m.text).startsWith('【系统'))
+    const talk = (msgs || []).filter((m) => (m.text || m.heard) && !String(m.text || '').startsWith('【系统'))
     if (!talk.length) return { episodes: [], facts: { added: 0, superseded: 0 } }
 
     const segs = segment(talk)

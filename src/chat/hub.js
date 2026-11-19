@@ -9,6 +9,7 @@ import { levelFor, presetForChat, isOwner, OWNER_ID } from './access.js'
 import { fetchImage } from '../core/net.js'
 import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
+import { createPromptSink } from '../core/prompt-sink.js'
 
 const WORKSPACE_DIR = process.env.AURALIFE_WORKSPACE || join(homedir(), 'AuraLife', 'chats')
 const WORKSPACE_TITLE = 'AuraLife · Web'
@@ -69,10 +70,10 @@ export function createHub({
     try {
       const saved = readJson(statsFile(), () => null)
       if (saved && typeof saved === 'object') {
-        return { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0, ...saved }
+        return { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0, read_no_reply: 0, ...saved }
       }
     } catch {}
-    return { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0 }
+    return { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0, read_no_reply: 0 }
   })()
   let statsTimer = null
   // stats.json 是跨进程共享文件：「整份读、整份写」会谁后写谁赢（面板数字回退/丢数）。
@@ -88,7 +89,7 @@ export function createHub({
     }
     return lockAndRun('stats', async () => {
       const saved = readJson(statsFile(), () => null)
-      const base = { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0 }
+      const base = { turns: 0, messages: 0, voice: 0, stickers: 0, images: 0, files: 0, errors: 0, read_no_reply: 0 }
       if (saved && typeof saved === 'object') for (const k of Object.keys(base)) base[k] = Number(saved[k]) || 0
       for (const k of keys) base[k] = (Number(base[k]) || 0) + pending[k]
       await writeJson(statsFile(), base)
@@ -134,6 +135,8 @@ export function createHub({
     statsPending[k] = (statsPending[k] || 0) + 1
     persistStatsSoon()
   }
+  // 记录钩子：器官/插件通过 hub.onPrompt(fn) 挂记录器，默认空着。
+  const promptSink = createPromptSink({ log })
   const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
 
   // 多进程下每个进程都跑一份插件，sessions.json 的读写要进锁，防互相覆盖丢会话映射。
@@ -594,6 +597,9 @@ export function createHub({
       }
     }
     logChat(chatId, 'bot', items.map((i) => (i.kind === 'text' || i.kind === 'voice' || i.kind === 'file' ? i.value : `[${i.kind}]`)).join(' '))
+    // 统计面板的「轮次」：以前全仓库没人 bump('turns')，所以永远是 0。真正发出去一轮记一次
+    // （silent 的「不说话」在上面已经提前 return，不算轮次）。
+    bump('turns')
     lastChatAt = Date.now()
     const ownerChat = isOwner(cfg, chatId)
     if (ownerChat) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
@@ -712,6 +718,9 @@ export function createHub({
     if (isOwner(cfg, userId)) lastOwnerChatAt = Date.now()
     onActivity?.({ kind: 'in', chatId, text: text || '[语音]', userId, nickname })
     const content = []
+    // 语音转录结果要留给下面的「睡着先记着」分支：以前 heard 只在 if 块里活着，
+    // pendingReply 只能拿到「[语音]」占位符，醒来补回时模型不知道对方说了什么。
+    let voiceHeard = ''
     if (voice && voice.data) {
 
       let heard = ''
@@ -730,6 +739,7 @@ export function createHub({
         log.warn('语音识别没成功：' + error.message)
       }
       if (heard) {
+        voiceHeard = heard
         content.push({ type: 'text', text: `【对方发来一条语音（约 ${Math.round(voice.dur || 0)} 秒），转成文字是：${heard}】` })
 
         const last = history.last(chatId)
@@ -793,7 +803,9 @@ export function createHub({
         // #5：只有主人在睡着时被找才值得补；客人的消息没有 catchup 会认领它，
         // 落盘只会把上一条还没补的主人消息挤掉——别记，直接算了。
         if (chatId === OWNER_ID) {
-          pendingReply = { chatId, at: Date.now(), text: text || (voice ? '[语音]' : sticker ? '[表情]' : '[消息]'), userId, level }
+          // 语音：带上转录（没有转录才退回占位符），醒来 catchup 才补得对。
+          const seen = text || (voiceHeard ? `[语音] ${voiceHeard}` : voice ? '[语音]' : sticker ? '[表情]' : '[消息]')
+          pendingReply = { chatId, at: Date.now(), text: seen, userId, level, ...(voiceHeard ? { heard: voiceHeard } : {}) }
           persistPendingReply(pendingReply)
         }
         log.info(`${chatId}：她睡着了，这条先不搭理`)
@@ -982,6 +994,18 @@ export function createHub({
     const dyn = (() => { try { return String(dynamicContext?.() || '').trim() } catch { return '' } })()
     const withState = dyn ? [{ type: 'text', text: `【你此刻的身体状态（每轮刷新，不是对方说的，也别说出来）】\n${dyn}` }, ...(content || [])] : content
     const admitted = await admit(agent, withState)
+    // 提示词记录钩子（契约见 core/prompt-sink.js）：admit 之后的真实内容才算数，
+    // 订阅者由器官/插件自己注册，默认没有订阅者 = 什么都不做。
+    promptSink.emit({
+      chatId: chat.chatId,
+      sessionId: String(agent.session?.id || ''),
+      via: opts.via || 'chat',
+      sender: String(senderId || ''),
+      senders: [...st.senders],
+      role: 'user',
+      blocks: admitted,
+      injected: dyn ? 0 : -1,
+    })
     startTyping(chat.chatId)
     try {
       await agent.followup({ id: randomUUID(), role: 'user', content: admitted, source: { kind: SOURCE_KIND } })
@@ -1017,6 +1041,16 @@ export function createHub({
           }
         }, timeoutMs)
         st.sysTimer = timer
+        promptSink.emit({
+          chatId: chat.chatId,
+          sessionId: String(agent.session?.id || ''),
+          via: 'system-turn',
+          sender: '',
+          senders: [],
+          role: 'user',
+          blocks: [{ type: 'text', text: prompt }],
+          injected: -1,
+        })
         await agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: SOURCE_KIND } })
         await dsh.sessions.flush(agent.session)
       } catch (e) {
@@ -1113,6 +1147,8 @@ export function createHub({
     sendImage,
     pushToSession,
     runSystemTurn,
+    // 提示词记录钩子：hub.onPrompt(fn) 注册，返回取消订阅函数；契约见 core/prompt-sink.js。
+    onPrompt: promptSink.register,
     turnSendersAllOwner,
     turnHasOwner,
     resetChat,

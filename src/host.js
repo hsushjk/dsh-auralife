@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { createLogger } from './core/logger.js'
-import { writeJson, dataDir, lockAndRun } from './core/store.js'
+import { writeJson, dataDir, lockAndRun, sweepStaleLocks } from './core/store.js'
 import { loadConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
 import { createStickerStore } from './features/stickers.js'
 import { scoreText, judgeChem } from './features/companion.js'
@@ -48,6 +48,11 @@ export function apply(ctx) {
   let maxLogMB = Number(loadConfig().logs?.maxMB) || 2
   const logger = createLogger({ dsh: ctx, getMaxBytes: () => maxLogMB * 1024 * 1024 })
   const log = logger.child('core')
+  // 上次进程被杀留下的锁文件不会自己消失：启动时先扫一遍（sweepStaleLocks 只删确定过期的）。
+  try {
+    const swept = sweepStaleLocks()
+    if (swept) log.info(`清掉 ${swept} 个残留锁文件`)
+  } catch (error) { log.warn('清扫残留锁失败：' + (error?.message || error)) }
   let cfg = loadConfig()
   const getConfig = () => cfg
   // 开关已收窄只有 TTS/STT/生图/提示音四个需要开关，其余模块恒开。
@@ -315,12 +320,18 @@ export function apply(ctx) {
   })
 
   memory = createMemoryV2({ dsh: ctx, getConfig, hub, log: logger.child('memory'), life, self, chemistry })
+  // 一次性整理：旧版本每次命中都往 facts 分片追加整行，同一个 id 会堆好几行；
+  // 命中计数已迁到 mem/fact-hits.json，这里把历史重复行清掉（进锁，多进程同时启动也安全）。
+  // 没有重复行时它几乎不做事，启动开销可以忽略。
+  memory.compactFacts?.()
+    .then((r) => { if (r && r.removed) logger.info(`记忆整理：清掉 ${r.removed} 行重复事实（${r.files} 个分片）`) })
+    .catch((error) => logger.warn('记忆整理失败：' + (error?.message || error)))
   azone = createAzone({
     getConfig, hub, log: logger.child('azone'), life,
 
     onDiary: (text) => memory.extractDiary(text),
   })
-  const azoneSocial = createAzoneSocial({ getConfig, hub, log: logger.child('azone'), memory, azone, botName: () => life.load().identity?.name || cfg.botName || 'AuraLife', emit: (type, payload) => web.emit(type, payload) })
+  const azoneSocial = createAzoneSocial({ getConfig, hub, log: logger.child('azone'), memory, azone, botName: () => life.load().identity?.name || cfg.botName || 'AuraLife', emit: (type, payload) => web.emit(type, payload), isSleeping: () => Boolean(sleep?.isSleeping?.()) })
   drive = createDrive({ getConfig, hub, log: logger.child('drive'), life, wishes, memory, chemistry, self: () => self, alarm: () => alarm, dsh: ctx, isMuted: () => false, emit: (type, payload) => web.emit(type, payload), sleep: () => sleep, energy: () => energy })
 
   // #6/#13：自我不只靠记忆重放长——聊得深/情绪重的时候，她也会想一想「我是什么样的人」。

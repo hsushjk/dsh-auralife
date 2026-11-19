@@ -14,8 +14,11 @@ export function cleanComment(text, max = 60) {
   return first.length > max ? first.slice(0, max) : first
 }
 
-export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName, emit }) {
+export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName, emit, isSleeping }) {
   // botName 可以是 getter（host.js 传 identity 优先的动态取值）。
+  // 睡觉时不逛空间、不回评论：睡着的数字生命不该在别人的留言下面说话。
+  // isSleeping 也允许是 getter（host 里 sleep 器官创建得比这里晚，见 host.js 装配顺序）。
+  const asleep = () => { try { return Boolean(isSleeping?.()) } catch { return false } }
   const herName = () => (typeof botName === 'function' ? botName() : botName) || 'AuraLife'
   const file = () => dataDir('azone-social.json')
   const load = () => readJson(file(), () => ({ day: '', count: 0, lastRun: 0, replied: {}, history: [] }))
@@ -92,8 +95,10 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
     }
   }
 
-  function commitTask(task, text, s) {
-    azone.addReply(task.entryId, task.commentId, { from: SELF, name: herName(), text })
+  async function commitTask(task, text, s) {
+    // 以前这里没 await：addReply 返回 Promise，写回失败/这条留言被删了也照记「已回复」。
+    const r = await azone.addReply(task.entryId, task.commentId, { from: SELF, name: herName(), text })
+    if (!r || r.ok === false) return false
     // 旧 memory.addEvent 已随记忆 v2 退役（v2 只有 remember/revise/forget），改走 remember。
     try {
       memory?.remember?.({
@@ -107,6 +112,7 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
     } catch {}
     record(s, { kind: 'reply', who: task.last.name, post: task.postText.slice(0, 30), text })
     emit?.('azone', { reason: 'reply', entryId: task.entryId })
+    return true
   }
 
   async function run({ force = false } = {}) {
@@ -114,6 +120,8 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
     const c = cfg.azoneSocial
     if (busy) return { ok: false, message: '正在逛空间' }
     if (!force && (!cfg.enabled || !c.enabled)) return { ok: false, message: '没打开' }
+    // force 也不放行：睡着就是睡着，留言等她醒了自己会看到（下个心跳会补）。
+    if (asleep()) return { ok: false, message: '她睡着了' }
     busy = true
     try {
       // 第一段（锁内）：只认领，不算模型。第二段（锁外）：逐条调模型。
@@ -134,7 +142,13 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
       }
 
       let replies = 0
-      for (const task of tasks) {
+      for (let ti = 0; ti < tasks.length; ti++) {
+        const task = tasks[ti]
+        // 生成一条要几分钟；中途睡着了就把还没轮到的认领全退回去，别把留言占着。
+        if (asleep()) {
+          for (let j = ti; j < tasks.length; j++) await releaseClaims(tasks[j])
+          break
+        }
         let text = ''
         try {
           text = await write(task.prompt)
@@ -148,12 +162,14 @@ export function createAzoneSocial({ getConfig, hub, log, memory, azone, botName,
           continue
         }
         try {
-          await lockAndRun('azone-social', () => {
+          const done = await lockAndRun('azone-social', async () => {
             const s = load()
             if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), count: 0 })
-            commitTask(task, text, s)
-            save(s)
+            const ok = await commitTask(task, text, s)
+            if (ok) save(s)
+            return ok
           }, { staleMs: 30000, timeoutMs: 10000 })
+          if (!done) { await releaseClaims(task); continue }
           replies++
         } catch (error) {
           log.warn('逛空间写回失败：', error.message)

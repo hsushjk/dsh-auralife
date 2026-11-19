@@ -1,6 +1,6 @@
 // —— 数据目录与 JSON 持久化（AuraLife 自己写的实现，2026-11 重写）——// 所有可写数据都放在 DSH 的插件数据目录下：
 //   <DSH_HOME>/plugins-data/auralife/…（可用 AURALIFE_DATA_DIR 覆盖，测试用）
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync, openSync, closeSync, existsSync, renameSync, copyFileSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, openSync, closeSync, existsSync, renameSync, copyFileSync, statSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 
@@ -82,6 +82,8 @@ const lockFileFor = (name) => dataDir('locks', `${name}.lock.json`)
 // 等锁的让出：不能 unref——调用方正在 await 这把锁，把定时器 unref 掉会让事件循环在
 // 「只剩等锁」时直接空掉（Node 会报 unsettled top-level await / 进程提前退出）。
 const lockSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, Math.max(0, ms)) })
+// 每个进程只需要在第一次取锁时清扫一次残留锁（见 sweepStaleLocks）。
+let locksSwept = false
 
 // 抢一次锁：成功返回 fd；被别的进程持有返回 null（顺手清掉超过 staleMs 的僵尸锁）。
 function tryAcquireFileLock(lockFile, staleMs) {
@@ -106,8 +108,39 @@ function tryAcquireFileLock(lockFile, staleMs) {
   }
 }
 
+// 启动清扫：进程被杀/崩溃时留下的锁文件不会自己消失，以前只在下一次抢同一把锁时
+// 才被 stale 逻辑顺带清掉；有些名字（比如只跑过一次的调试入口）可能永远没人再抢。
+// 这里扫一遍 locks/，只删「确定过期」的：owner.at（心跳）或文件 mtime 已经超过 staleMs。
+// 0 字节/半截 JSON 的活跃锁 mtime 是新的，不会被误删。
+export function sweepStaleLocks(staleMs = 15000, now = Date.now()) {
+  const dir = dataDir('locks')
+  let names = []
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.lock.json')) } catch { return 0 }
+  let removed = 0
+  for (const name of names) {
+    const file = join(dir, name)
+    try {
+      let abandoned = false
+      try {
+        const owner = JSON.parse(readFileSync(file, 'utf8'))
+        abandoned = !owner || now - (Number(owner.at) || 0) > staleMs
+      } catch {
+        const st = statSync(file)
+        abandoned = now - st.mtimeMs > staleMs
+      }
+      if (abandoned) { unlinkSync(file); removed++ }
+    } catch { /* 恰好被别人释放/删除：跳过 */ }
+  }
+  return removed
+}
+
 export async function lockAndRun(name, fn, opts = {}) {
   const { staleMs = 15000, timeoutMs = 8000, spinMs = 15 } = opts
+  // 首次取锁时顺手扫一遍残留锁（每个进程一次即可，失败不影响正常抢锁）。
+  if (!locksSwept) {
+    locksSwept = true
+    try { sweepStaleLocks() } catch { /* 清理失败就退回「抢到时再清」的老路 */ }
+  }
   const lockFile = lockFileFor(name)
   const giveUpAt = Date.now() + timeoutMs
   const token = `${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`

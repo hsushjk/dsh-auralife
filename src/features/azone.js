@@ -1,4 +1,4 @@
-import { dataDir, readJson, writeJson, lockAndRun } from '../core/store.js'
+import { dataDir, readJson, writeJson, lockAndRun, numOr } from '../core/store.js'
 
 const toMin = (hhmm) => {
   const [h, m] = String(hhmm).split(':').map(Number)
@@ -12,8 +12,11 @@ const newId = (p = 'd') => `${p}${Date.now().toString(36)}${Math.random().toStri
 // 触发器三种
 //   1. 想写就写：Ta 自己有 web_write_diary 工具，任何时候都能写；
 //   2. 闲着：距最后一条主人消息 ≥ 3 小时（醒着时段 08:00-23:30），每天最多 2 篇；
-//   3. 有必要：当天有激素大波动（多巴胺偏离基线 ≥20 或皮质醇 ≥65），每天最多 2 篇。
+//   3. 有必要：当天有激素大波动（单次事件的激素增量绝对值 ≥5），每天最多 2 篇。
 const DIARY_BUILTIN = { minChars: 60, maxChars: 140, idleAfterMinutes: 180, idleDailyMax: 2, eventDailyMax: 2, quietFrom: '08:00', quietTo: '23:30' }
+// chemistry.history 存的是「这次事件涨跌了多少」（±几），不是 0-100 的绝对水平；
+// 情绪事件的实际量级在 1-8（debug 手动可到 ±50），所以 5 才算「大波动」。
+const SPIKE_DELTA = 5
 
 export function createAzone({ getConfig, hub, log, onDiary, life }) {
   const file = () => dataDir('diary.json')
@@ -158,8 +161,9 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
 
     // #36：双进程抢写——不能「先看再写」（两边都看到 due、锁外各写一篇）。
     // 锁内先认领：通过就把时间戳推进 triggers（占住这次名额），写失败再回滚。
+    let spikeAt = 0
     const gates = await update((s) => {
-      if (!s.triggers || s.triggers.day !== today) s.triggers = { day: today, idle: [], event: [] }
+      if (!s.triggers || s.triggers.day !== today) s.triggers = { day: today, idle: [], event: [], eventAt: 0 }
       let dueIdle = false
       if (inWindow) {
         // #37：hub.lastOwnerChatAt 是进程内存，重启归零；用 life.lastSeenAt（落盘）兜底，
@@ -172,23 +176,32 @@ export function createAzone({ getConfig, hub, log, onDiary, life }) {
       }
       let dueEvent = false
       if (!dueIdle) {
-        let spike = false
+        // chemistry.history 每条只存「这次事件涨跌了多少」（dopamine/cortisol/serotonin 都是增量），
+        // 不是 0-100 的绝对水平。以前拿增量去比「偏离基线 20 / 皮质醇 65」，只要当天有一条
+        // 记录（哪怕全是 0）就恒真 → 10 分钟防重窗口一过必然再写一篇，天天两篇。
+        // 现在按增量阈值找「最近一次真正的大波动」，并用 eventAt 记下已被哪篇日记消费过。
+        let latest = null
         try {
           const hist = (life && life.load && life.load().chemistry && life.load().chemistry.history) || []
-          spike = hist.some((h) => {
-            const d = h.at ? new Date(h.at) : null
-            if (!d || dayKey(d) !== today) return false
-            const maxAbs = Math.max(Math.abs(h.dopamine - 50), Math.abs(h.serotonin - 50))
-            return maxAbs >= 20 || h.cortisol >= 65
-          })
+          for (const h of hist) {
+            if (!h || !h.at) continue
+            if (dayKey(new Date(h.at)) !== today) continue
+            const delta = Math.max(Math.abs(numOr(h.dopamine, 0)), Math.abs(numOr(h.cortisol, 0)), Math.abs(numOr(h.serotonin, 0)))
+            if (delta < SPIKE_DELTA) continue
+            if (!latest || h.at > latest.at) latest = h
+          }
         } catch {}
-        if (spike && s.triggers.event.length < DIARY_BUILTIN.eventDailyMax) dueEvent = true
+        const consumed = numOr(s.triggers.eventAt, 0)
+        if (latest && latest.at > consumed && s.triggers.event.length < DIARY_BUILTIN.eventDailyMax) {
+          dueEvent = true
+          spikeAt = latest.at
+        }
       }
       // 另一个进程刚认领过（10 分钟内）→ 让位，避免双进程同一波各写一篇。
       const recent = [...(s.triggers.idle || []), ...(s.triggers.event || [])].some((t) => Number.isFinite(Number(t)) && Date.now() - Number(t) < 10 * 60_000)
       if (recent) return {}
       if (dueIdle) { const at = Date.now(); s.triggers.idle.push(at); return { due: 'idle', at } }
-      if (dueEvent) { const at = Date.now(); s.triggers.event.push(at); return { due: 'event', at } }
+      if (dueEvent) { const at = Date.now(); s.triggers.event.push(at); s.triggers.eventAt = spikeAt || at; return { due: 'event', at } }
       return {}
     })
 

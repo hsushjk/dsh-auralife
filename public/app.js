@@ -1184,7 +1184,7 @@ function bindDiaryEvents(body) {
       const text = (inp?.value || '').trim()
       if (!text) return
       const r = await api('/api/diary/comment', { method: 'POST', body: { entryId: eid, text } })
-      toast(r.ok ? '留言好了' : (r.reason || '没发出去'), r.ok ? '' : 'err')
+      toast(r.ok ? '留言好了' : (r.reason || r.message || '没发出去'), r.ok ? '' : 'err')
       loadDiary()
     }
   }

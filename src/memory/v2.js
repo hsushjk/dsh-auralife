@@ -159,10 +159,12 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
           } catch { continue }
           if (!msgs.length) continue
           const since = Number(wm[chatId]) || 0
-          const fresh = msgs.filter((m) => (m.t || 0) > since && m.text && !String(m.text).startsWith('【系统'))
+          // 语音消息的正文只有「[语音 · 2秒]」占位符，真正说的是 m.heard（转录）；
+          // 以前这里只搬 text，编码侧永远读不到转录，事件摘要会写成「只收到语音，没有可转写内容」。
+          const fresh = msgs.filter((m) => (m.t || 0) > since && (m.text || m.heard) && !String(m.text || '').startsWith('【系统'))
           if (!fresh.length) continue
           claims[chatId] = { at: Date.now(), upto: Math.max(since, ...fresh.map((m) => m.t)) }
-          out.push({ chatId, since, fresh: fresh.map((m) => ({ id: m.id, t: m.t, who: m.who, uid: m.uid, text: m.text })) })
+          out.push({ chatId, since, fresh: fresh.map((m) => ({ id: m.id, t: m.t, who: m.who, uid: m.uid, text: m.text, heard: m.heard })) })
         }
         runs.consolidateClaims = claims
         saveRuns(runs)
@@ -401,6 +403,8 @@ export function createMemoryV2({ dsh, getConfig, hub, log = console, life, self,
     spontaneous: (now = Date.now(), opts = {}) => recallModule.spontaneous(now, opts),
     // 内部（host.js 装配用 / 面板自证用）
     store, recallModule, encode, replay, receipt,
+    // 启动时的一次性整理：命中计数迁到单独文件后，把 facts 分片里同 id 的重复行清掉。
+    compactFacts: () => store.compactFacts(),
     migrate: () => migrateLegacy({ store, log }),
   }
 }

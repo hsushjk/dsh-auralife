@@ -12,7 +12,7 @@
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { dataDir, ensureDir, numOr, lockAndRun } from '../core/store.js'
+import { dataDir, ensureDir, numOr, lockAndRun, readJson, writeJson } from '../core/store.js'
 import { inferKind } from './similar.js'
 
 export const monthKey = (t = Date.now()) => {
@@ -60,13 +60,32 @@ export function createMemStore({ log = console } = {}) {
     return out
   }
 
+  // 命中计数单独存一个 JSON：以前 bumpHit 每次都把整条事实 append 一遍，facts 分片里
+  // 同一个 id 会堆出好几行（只多了 hits/hitDays/lastHit 字段）。现在计数走这里，
+  // 分片只留事实本身；读的时候再合并回最新一行。
+  const hitsFile = () => join(root(), 'fact-hits.json')
+  const loadHits = () => {
+    const h = readJson(hitsFile(), () => ({}))
+    return h && typeof h === 'object' && !Array.isArray(h) ? h : {}
+  }
+  const hitsStamp = () => {
+    try { const st = statSync(hitsFile()); return `${st.size}:${st.mtimeMs}` } catch { return '' }
+  }
+
   function all() {
-    const stamp = `${stampOf('facts')}#${stampOf('episodes')}#${stampOf('edges')}`
+    const stamp = `${stampOf('facts')}#${stampOf('episodes')}#${stampOf('edges')}#${hitsStamp()}`
     if (cache && cache.stamp === stamp) return cache
-    // 事实按 id 取「最后一行」：bumpHit 会追加同一 id 的新行（只改命中计数），
-    // 后面的行是更新的状态；内容字段（t0/text/supersedes）从不改写，所以 last-wins 安全。
+    // 事实按 id 取「最后一行」：supersede/forget/markSpoken 等会把同一 id 的更新状态追加成新行
+    // （命中计数已迁到 fact-hits.json，不再追加），后面的行是更新的状态；内容字段从不就地改写，
+    // 所以 last-wins 安全。
     const factsById = new Map()
     for (const f of loadLines(dirOf('facts'))) factsById.set(f.id, f)
+    const hits = loadHits()
+    for (const [id, h] of Object.entries(hits)) {
+      const f = factsById.get(id)
+      if (!f) continue
+      factsById.set(id, { ...f, hits: numOr(h.hits, 0), hitDays: numOr(h.hitDays, 0), lastHit: numOr(h.lastHit, 0) })
+    }
     cache = {
       stamp,
       facts: [...factsById.values()],
@@ -157,6 +176,7 @@ export function createMemStore({ log = console } = {}) {
 
   // 命中仅更新 hits/lastSeen，不动 t0（修 memory.js:160 的 bug）
   // 多进程下 find→append 的读-改-写进锁（审计：无锁 RMW）。
+  // 计数不再追加事实行：写 mem/fact-hits.json，读时由 all() 合并（见文件头注释）。
   function bumpHit(id, now = Date.now()) {
     return lockAndRun('mem-facts', () => {
       // 锁内读之前先丢掉进程缓存：all() 的 cache 只有本进程 append 时才失效，
@@ -164,10 +184,18 @@ export function createMemStore({ log = console } = {}) {
       invalidate()
       const f = findFact(id)
       if (!f) return false
-      if (!f.lastHit || new Date(f.lastHit).toDateString() !== new Date(now).toDateString()) f.hitDays = (f.hitDays || 0) + 1
-      f.hits = (f.hits || 0) + 1
-      f.lastHit = now
-      append('facts', { ...f })
+      const hits = loadHits()
+      const cur = hits[id] || {}
+      const oldDays = numOr(cur.hitDays, numOr(f.hitDays, 0))
+      const oldHit = numOr(cur.lastHit, numOr(f.lastHit, 0))
+      const sameDay = oldHit && new Date(oldHit).toDateString() === new Date(now).toDateString()
+      hits[id] = {
+        hits: numOr(cur.hits, numOr(f.hits, 0)) + 1,
+        hitDays: oldDays + (sameDay ? 0 : 1),
+        lastHit: now,
+      }
+      writeJson(hitsFile(), hits)
+      invalidate()
       return true
     }, { staleMs: 10000, timeoutMs: 5000 })
   }
@@ -349,8 +377,52 @@ export function createMemStore({ log = console } = {}) {
     const facts = filterKind('facts', (r) => r.chatId !== id && r.subj !== id)
     const eps = filterKind('episodes', (r) => r.chatId !== id)
     const edges = filterKind('edges', (r) => !removed.has(r.a) && !removed.has(r.b))
+    // 被删掉的事实不该再在命中计数里留着一行
+    if (removed.size) {
+      const hits = loadHits()
+      let touched = false
+      for (const fid of removed) if (hits[fid]) { delete hits[fid]; touched = true }
+      if (touched) writeJson(hitsFile(), hits)
+    }
     invalidate()
     return { facts, episodes: eps, edges }
+    }, { staleMs: 10000, timeoutMs: 15000 })
+  }
+
+  // 一次性整理 facts 分片：同一个 id 只保留最后一行（旧的命中追加行、坏行清掉）。
+  // 只在启动时跑一次，且只在真发现重复/坏行时才重写；重写本身是整份覆盖，addFact 的 append
+  // 不参与这把锁，所以理论上和别的进程同毫秒追加可能丢一行——启动时撞上的概率极低，
+  // 用紧凑的文件换掉历史堆积更划算。返回 {files,removed}。
+  function compactFacts() {
+    return lockAndRun('mem-facts', () => {
+      invalidate()
+      const dir = dirOf('facts')
+      let names = []
+      try { names = readdirSync(dir).filter((f) => f.endsWith('.jsonl')).sort() } catch { return { files: 0, removed: 0 } }
+      let files = 0
+      let removed = 0
+      for (const name of names) {
+        const p = join(dir, name)
+        let txt = ''
+        try { txt = readFileSync(p, 'utf8') } catch { continue }
+        const lines = txt.split('\n').map((l) => l.trim()).filter(Boolean)
+        const parsed = lines.map((line) => { try { return JSON.parse(line) } catch { return null } })
+        const last = new Map()
+        parsed.forEach((rec, i) => { if (rec && rec.id != null) last.set(String(rec.id), i) })
+        const keep = []
+        for (let i = 0; i < parsed.length; i++) {
+          const rec = parsed[i]
+          if (!rec || rec.id == null) { removed++; continue }
+          if (last.get(String(rec.id)) !== i) { removed++; continue }
+          keep.push(lines[i])
+        }
+        if (keep.length !== lines.length) {
+          writeFileSync(p, keep.length ? keep.join('\n') + '\n' : '')
+          files++
+        }
+      }
+      invalidate()
+      return { files, removed }
     }, { staleMs: 10000, timeoutMs: 15000 })
   }
 
@@ -375,6 +447,6 @@ export function createMemStore({ log = console } = {}) {
     currentFacts, findFact, headOf, factsBySubj,
     bumpHit, supersede, forget, linkEvidence,
     markSpoken, markAudited, setFactKind,
-    stats, newId, monthKey, clear, purgeChat,
+    stats, newId, monthKey, clear, purgeChat, compactFacts,
   }
 }
