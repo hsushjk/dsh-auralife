@@ -406,7 +406,7 @@ export function apply(ctx) {
   ctx.effect(() => {
     const off = ctx.on('agent/request', async (_payload, next) => {
       const current = await next()
-      try { energy.spend().catch(() => {}) } catch {} // 每次模型请求消耗一点血条
+      // 体力不在这里扣：按模型请求扣会被工具调用放大（一轮 3~5 次），改到 turn/start 每轮一次。
       let chem
       try { chem = chemistry.peek() } catch { return current }
       let temperature

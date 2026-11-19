@@ -206,7 +206,7 @@ export function normalize(raw) {
   delete c.mood // 心情已删情绪归三激素管，旧残留键整体清掉
   for (const k of ['recallCount', 'dailyConsolidate', 'consolidateTimes']) delete c.memory[k]
   for (const k of ['maxPerDay', 'quietFrom', 'quietTo', 'idleMinutes', 'minGapMinutes', 'pressureThreshold']) delete c.drive[k]
-  for (const k of ['costPerRequest', 'recoverPerMinute']) delete c.energy[k]
+  for (const k of ['costPerTurn', 'costPerRequest', 'recoverPerMinute']) delete c.energy[k]
   delete c.energy.balance
   for (const k of ['autoChance', 'autoMaxChars']) delete c.voice[k]
   for (const k of ['autoChance', 'maxPerHour', 'maxLibrary']) delete c.stickers[k]

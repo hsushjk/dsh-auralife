@@ -1,7 +1,8 @@
 // life/energy.js — 身体（体力，S3 简化版）。
-// 血条 level（体力）：纯作息驱动（DESIGN-modular.md §4）——每次模型请求消耗、随时间恢复，
+// 血条 level（体力）：纯作息驱动（DESIGN-modular.md §4）——按「轮」消耗、随时间恢复，
 // 不跟宿主机 CPU/内存挂钩（需求 3）。口粮（余额映射）已按用户要求删除。
-// 内部全部浮点计算，只在展示层取整——避免 0.5/次 被 Math.round 吃掉导致「体力没变化」。
+// 按轮扣而不是按模型请求扣：一轮里工具调用越多请求越多，按请求算会把带工具的轮次放大 3~5 倍。
+// 内部全部浮点计算，只在展示层取整——避免 0.6/次 被 Math.round 吃掉导致「体力没变化」。
 
 import { inRange } from '../core/time.js'
 
@@ -11,8 +12,9 @@ function clamp(v, lo = 0, hi = 100) {
 }
 
 // 内置常量（§3）：消耗与恢复速率归 Ta 自己，用户不可调。
-// 0.8/次 + 0.8/分钟清醒、1.6/分钟睡觉聊 10 条约 -8（微微累），不聊慢慢回，睡觉回得更快。
-const ENERGY_BUILTIN = { costPerRequest: 0.8, recoverPerMinute: 0.8, recoverAsleepPerMinute: 1.6 }
+// 0.6/轮 + 0.8/分钟清醒、1.6/分钟睡觉：连聊 10 轮带工具合计 -6（微微累），45 秒回满一轮；
+// 只输出 [沉默]/这轮没发出消息的，退一半（净 0.3），不惩罚「不想说话」。
+const ENERGY_BUILTIN = { costPerTurn: 0.6, silentRefund: 0.3, recoverPerMinute: 0.8, recoverAsleepPerMinute: 1.6 }
 
 export function defaultEnergy(now = Date.now()) {
   return { version: 1, at: now, level: 100 }
@@ -62,12 +64,28 @@ export function createEnergy({ life, getConfig, log }) {
     })
   }
 
-  // 消耗：每次模型请求 −costPerRequest。读-算-写整体进锁。
-  function spend(now = Date.now()) {
+  // 消耗：一轮 −costPerTurn（turn/start 时扣；工具调用再多也只扣一次）。读-算-写整体进锁。
+  function spendTurn(now = Date.now()) {
+    return spend(now, ENERGY_BUILTIN.costPerTurn)
+  }
+
+  // 沉默轮 / 空轮退回 silentRefund（净消耗一半）：不想说话不算「干了一轮活」。
+  function refundTurn(now = Date.now()) {
     return life.update((st) => {
       const raw = normalizeEnergy(st.energy)
       const base = recovered(raw, now, st.rhythm)
-      const next = { version: 1, at: now, level: clamp(base.level - ENERGY_BUILTIN.costPerRequest, 0, 100) }
+      const next = { version: 1, at: now, level: clamp(base.level + ENERGY_BUILTIN.silentRefund, 0, 100) }
+      st.energy = next
+      return next
+    })
+  }
+
+  // 手动扣血（调试页/测试用）：默认扣一轮的量；不传就 −costPerTurn。
+  function spend(now = Date.now(), cost = ENERGY_BUILTIN.costPerTurn) {
+    return life.update((st) => {
+      const raw = normalizeEnergy(st.energy)
+      const base = recovered(raw, now, st.rhythm)
+      const next = { version: 1, at: now, level: clamp(base.level - cost, 0, 100) }
       st.energy = next
       return next
     })
@@ -103,5 +121,5 @@ export function createEnergy({ life, getConfig, log }) {
     return '[身体状态] 你此刻精神不错，身体已经缓过来了，语气按平时的来就好。这些不用说出来，从语气里自然透出来。'
   }
 
-  return { load, tick, peek, spend, gate, state: peek, contextLine }
+  return { load, tick, peek, spend, spendTurn, refundTurn, gate, state: peek, contextLine }
 }

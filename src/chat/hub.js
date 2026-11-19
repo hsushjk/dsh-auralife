@@ -602,7 +602,7 @@ export function createHub({
   async function deliver(chatId, text, opts = {}) {
     const cfg = getConfig()
     const r = parseReply(text)
-    if (r.silent) { log.info(`${chatId}：Ta 选择不说话`); await wakeWindowDone(); return }
+    if (r.silent) { log.info(`${chatId}：Ta 选择不说话`); await wakeWindowDone(); return { silent: true, sent: 0 } }
     let items = r.items
     if (opts.wantVoice && cfg.voice.enabled && !items.some((i) => i.kind === 'voice')) {
       const spoken = items.filter((i) => i.kind === 'text').map((i) => i.value).join('，')
@@ -647,6 +647,7 @@ export function createHub({
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '', userId: ownerChat ? OWNER_ID : chatId, level: ownerChat ? 'full' : 'social' })
     // 被叫醒后的「暂时醒着」：聊完这一轮自动回睡（#25）。
     await wakeWindowDone()
+    return { silent: false, sent: items.length }
   }
 
   async function deliverTo(target, text) {
@@ -677,12 +678,37 @@ export function createHub({
     emit?.('typing', { chatId, on: false })
   }
 
+  // 体力按轮扣：turn/start 时一次（工具调用再多也不重复），沉默/空轮在 turn/end 退一半。
+  // 只对映射到聊天的会话生效，别的 DSH 会话（比如别的工作区 agent）不耗她的体力。
+  function spendTurnEnergy() {
+    try {
+      const p = energyOf()?.spendTurn?.()
+      if (p && typeof p.catch === 'function') p.catch((e) => log.warn('体力消耗失败：' + (e?.message || e)))
+    } catch (e) { log.warn('体力消耗失败：' + (e?.message || e)) }
+  }
+
+  function refundTurnEnergy() {
+    try {
+      const p = energyOf()?.refundTurn?.()
+      if (p && typeof p.catch === 'function') p.catch((e) => log.warn('体力退回失败：' + (e?.message || e)))
+    } catch (e) { log.warn('体力退回失败：' + (e?.message || e)) }
+  }
+
   function onSessionEvent(session, event) {
     const key = sessionKey(session && session.id)
     const chatId = sessionToChat.get(key)
     if (!chatId || !event) return
-    const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set() }
+    const st = turnState.get(key) || { lastTurn: -1, spentTurn: -1, text: '', senders: new Set() }
     turnState.set(key, st)
+    if (event.type === 'turn/start') {
+      const turn = Number((event.data || {}).turn)
+      // 同一轮的 turn/start 只扣一次；没有 turn 号（旧格式）时才按事件各扣一次。
+      if (!Number.isFinite(turn) || turn !== st.spentTurn) {
+        if (Number.isFinite(turn)) st.spentTurn = turn
+        spendTurnEnergy()
+      }
+      return
+    }
     if (event.type === 'assistant/message') {
       const d = event.data || {}
       if (d.interrupted) return
@@ -727,8 +753,12 @@ export function createHub({
         return
       }
       if (!completed) { log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}），不发`); release(chatId); return }
-      if (!text) { wakeWindowDone().catch(() => {}); return release(chatId) }
-      deliver(chatId, text, { wantVoice, userText: lastText }).catch((e) => log.warn('发送出错：' + e.message)).finally(() => release(chatId))
+      if (!text) { refundTurnEnergy(); wakeWindowDone().catch(() => {}); return release(chatId) }
+      deliver(chatId, text, { wantVoice, userText: lastText })
+        // 沉默轮/一个气泡都没发出去的轮：退一半体力（不想说话不该按干了一轮活算）。
+        .then((info) => { if (info && (info.silent || info.sent === 0)) refundTurnEnergy() })
+        .catch((e) => log.warn('发送出错：' + e.message))
+        .finally(() => release(chatId))
     }
   }
 

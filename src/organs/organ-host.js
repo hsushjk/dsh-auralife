@@ -37,7 +37,7 @@ export const BUILTIN_ORGANS = [
   {
     id: 'energy',
     name: '身体',
-    description: '体力血条：纯作息驱动（每次模型请求消耗、随时间恢复）',
+    description: '体力血条：纯作息驱动（每轮对话消耗、随时间恢复，沉默轮退一半）',
     capabilities: [{ id: 'vitality', name: '精力', description: '感知自己的体力，疲惫时话短、休息时恢复' }],
   },
   {
