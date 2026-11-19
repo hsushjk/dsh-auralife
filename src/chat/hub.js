@@ -10,6 +10,8 @@ import { fetchImage } from '../core/net.js'
 import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
 import { createPromptSink } from '../core/prompt-sink.js'
+import { quoteOfMessage, resolveQuote } from './quote.js'
+import { initTurnText, rememberTurnText, takeTurnText } from './turn-text.js'
 
 const WORKSPACE_DIR = process.env.AURALIFE_WORKSPACE || join(homedir(), 'AuraLife', 'chats')
 const WORKSPACE_TITLE = 'AuraLife · Web'
@@ -258,34 +260,6 @@ export function createHub({
     try { unlinkSync(join(chatlogDir(), `${day}.jsonl`)) } catch {}
   }
 
-  // ——引用（quote）——
-  // 消息上的 quote 只是一份快照：{ id, who, text, at, kind }。display 不依赖原消息还在，
-  // 翻到旧分片里也能看清“在回哪句”；模型侧拿到的是同一份文本。
-  function quoteTextOf(m) {
-    if (!m) return ''
-    if (m.kind === 'voice') return m.heard ? `[语音] ${m.heard}` : String(m.text || '[语音]')
-    if (m.kind === 'image') return '[图片]'
-    if (m.kind === 'sticker') return m.name ? `[表情 ${m.name}]` : '[表情]'
-    if (m.kind === 'file') return `[文件] ${m.fileName || ''}`.trim()
-    return String(m.text || '').slice(0, 300)
-  }
-
-  function quoteOfMessage(m) {
-    if (!m || !m.id) return null
-    const text = quoteTextOf(m)
-    if (!text) return null
-    return { id: String(m.id), who: m.who === 'bot' ? 'bot' : 'user', text, at: Number(m.t) || 0, kind: m.kind || 'text' }
-  }
-
-  function cleanQuote(q) {
-    if (!q || typeof q !== 'object') return null
-    const id = String(q.id || '').trim().slice(0, 80)
-    const text = String(q.text || '').trim().slice(0, 300)
-    if (!id || !text) return null
-    const kind = ['text', 'voice', 'sticker', 'image', 'file'].includes(q.kind) ? q.kind : 'text'
-    return { id, who: q.who === 'bot' ? 'bot' : 'user', text, at: Number(q.at) || 0, kind }
-  }
-
   async function appendMessage(chatId, payload) {
     let msg = null
     try {
@@ -310,6 +284,11 @@ export function createHub({
   // 「一个分片文件 = 一页」的取法，网页端翻历史用
   function pageFileOf(chatId, opts) {
     return history.pageFile(chatId, opts)
+  }
+
+  // 按 id 定位一条历史消息（网页端「跳到被引用的那条」用；跨分片可查）。
+  function locateOf(chatId, id) {
+    return history.findById(chatId, id)
   }
 
   function historyStats(chatId) {
@@ -698,7 +677,7 @@ export function createHub({
     const key = sessionKey(session && session.id)
     const chatId = sessionToChat.get(key)
     if (!chatId || !event) return
-    const st = turnState.get(key) || { lastTurn: -1, spentTurn: -1, text: '', senders: new Set() }
+    const st = turnState.get(key) || { lastTurn: -1, spentTurn: -1, text: '', senders: new Set(), turnText: initTurnText() }
     turnState.set(key, st)
     if (event.type === 'turn/start') {
       const turn = Number((event.data || {}).turn)
@@ -727,14 +706,16 @@ export function createHub({
         else if (!usageWarned) { usageWarned = true; log.warn('assistant/message.usage 字段无法识别：' + Object.keys(us).join(',')) }
       }
       const t = textOf(d.message)
-      if (t) { st.lastTurn = d.turn; st.text = t }
+      if (t) { st.lastTurn = d.turn; st.text = t; rememberTurnText(st.turnText, d.turn, t) }
       return
     }
     if (event.type === 'turn/end') {
       stopTyping(chatId)
       const d = event.data || {}
       const completed = d.reason && d.reason.kind === 'completed'
-      const text = st.lastTurn === d.turn ? st.text : ''
+      // 按轮号取：晚到/乱序的 turn/end 也能拿到自己那一轮的文本，不会把有空轮的判成空轮。
+      const byTurn = takeTurnText(st.turnText, d.turn)
+      const text = byTurn || (st.lastTurn === d.turn ? st.text : '')
       const sys = st.system
       const sysTimedOut = Boolean(st.systemTimedOut)
       const wantVoice = Boolean(st.wantVoice)
@@ -752,7 +733,13 @@ export function createHub({
         else sys.reject(new Error('这一轮没正常结束：' + (d.reason?.kind || '?')))
         return
       }
-      if (!completed) { log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}），不发`); release(chatId); return }
+      if (!completed) {
+        // 中断的轮也不该按干满一轮算：没发出去就算空轮，退一半。
+        refundTurnEnergy()
+        log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}），不发，按空轮退一半体力`)
+        release(chatId)
+        return
+      }
       if (!text) { refundTurnEnergy(); wakeWindowDone().catch(() => {}); return release(chatId) }
       deliver(chatId, text, { wantVoice, userText: lastText })
         // 沉默轮/一个气泡都没发出去的轮：退一半体力（不想说话不该按干了一轮活算）。
@@ -766,7 +753,8 @@ export function createHub({
 
   async function onUserMessage({ chatId, userId, nickname, text = '', images = [], files = [], voice = null, sticker = '', level = '', quote = null }) {
     const cfg = getConfig()
-    const quoted = cleanQuote(quote)
+    // 客户端快照只用来拿 id；文本/身份以服务端历史里的真实消息为准，防伪造。
+    const quoted = resolveQuote(history, chatId, quote)
     const wantVoice = Boolean(voice && voice.data)
     typingUntil.delete(chatId)
     let userSticker = null
@@ -1065,7 +1053,7 @@ export function createHub({
     const agent = await agentFor(chat)
     const key = sessionKey(agent.session?.id)
     let st = turnState.get(key)
-    if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), lastText: '', prevText: '' }; turnState.set(key, st) }
+    if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), lastText: '', prevText: '', turnText: initTurnText() }; turnState.set(key, st) }
     if (senderId) st.senders.add(senderId)
     const textPart = (content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n')
     if (textPart) { st.prevText = st.lastText; st.lastText = textPart }
@@ -1109,7 +1097,7 @@ export function createHub({
         const agent = await agentFor(chat)
         const key = sessionKey(agent.session?.id)
         let st = turnState.get(key)
-        if (!st) { st = { lastTurn: -1, text: '', senders: new Set() }; turnState.set(key, st) }
+        if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), turnText: initTurnText() }; turnState.set(key, st) }
         st.system = { resolve, reject }
         timer = setTimeout(() => {
           const s = turnState.get(key)
@@ -1253,6 +1241,7 @@ export function createHub({
     messagesOf,
     pageOf,
     pageFileOf,
+    locateOf,
     historyStats,
     cleanupVoice,
     takePendingReply,

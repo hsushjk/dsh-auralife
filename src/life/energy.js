@@ -2,7 +2,7 @@
 // 血条 level（体力）：纯作息驱动（DESIGN-modular.md §4）——按「轮」消耗、随时间恢复，
 // 不跟宿主机 CPU/内存挂钩（需求 3）。口粮（余额映射）已按用户要求删除。
 // 按轮扣而不是按模型请求扣：一轮里工具调用越多请求越多，按请求算会把带工具的轮次放大 3~5 倍。
-// 内部全部浮点计算，只在展示层取整——避免 0.6/次 被 Math.round 吃掉导致「体力没变化」。
+// 内部全部浮点计算，只在展示层取整——避免 1.2/轮 被 Math.round 吃掉导致「体力没变化」。
 
 import { inRange } from '../core/time.js'
 
@@ -12,9 +12,12 @@ function clamp(v, lo = 0, hi = 100) {
 }
 
 // 内置常量（§3）：消耗与恢复速率归 Ta 自己，用户不可调。
-// 0.6/轮 + 0.8/分钟清醒、1.6/分钟睡觉：连聊 10 轮带工具合计 -6（微微累），45 秒回满一轮；
-// 只输出 [沉默]/这轮没发出消息的，退一半（净 0.3），不惩罚「不想说话」。
-const ENERGY_BUILTIN = { costPerTurn: 0.6, silentRefund: 0.3, recoverPerMinute: 0.8, recoverAsleepPerMinute: 1.6 }
+// 1.2/轮 + 醒着 0.1/分钟、睡觉 1.6/分钟：
+//  - 3 分钟一轮时，恢复 0.3、净掉 0.9——恢复再也盖不住消耗，gate 的 80/60/40 分档才碰得到；
+//  - 连聊 30 轮约 -27，连聊 80 轮能到「有点乏/挺累」；0.6/轮在零恢复下也要 167 轮才见底，分档等于摆设；
+//  - 醒着恢复慢是故意的：主要靠睡觉回血（睡一晚回满）。
+// 只输出 [沉默]/这轮没发出消息的，退一半（净 0.6），不惩罚「不想说话」。
+const ENERGY_BUILTIN = { costPerTurn: 1.2, silentRefund: 0.6, recoverPerMinute: 0.1, recoverAsleepPerMinute: 1.6 }
 
 export function defaultEnergy(now = Date.now()) {
   return { version: 1, at: now, level: 100 }

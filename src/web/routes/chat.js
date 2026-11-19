@@ -1,4 +1,5 @@
-// 引用快照只带显示需要的字段；服务端再清洗一遍，前端传坏了也不至于把脏数据写进历史。
+// 引用快照只带显示需要的字段；这里只做形状清洗，真正落盘前 hub 会按 id 回查
+// 真实消息并重建快照（客户端传的 text/who 一律不信，防伪造「你之前说过的话」）。
 function cleanQuote(q) {
   if (!q || typeof q !== 'object') return null
   const id = String(q.id || '').trim().slice(0, 80)
@@ -42,6 +43,17 @@ export function register(router, ctx) {
       hasMore: page.hasMore,
       segment: { limit },
     })
+  })
+
+  // 按 id 定位一条历史消息（引用跳转用）：被引用的那条可能在旧分片里，
+  // 前端先查这里，知道它存在再往前翻页，不用盲目翻到底。
+  router.add('GET', 'api/messages/locate', async (req, res, url) => {
+    const me = requireUser(req, res); if (!me) return
+    const chatId = chatIdOf(me.subject)
+    const id = String(url?.searchParams?.get('id') || '').trim().slice(0, 80)
+    const message = id.length >= 6 ? hub.locateOf(chatId, id) : null
+    if (!message) return json(res, { ok: false, reason: '那条消息已经找不到了' })
+    return json(res, { ok: true, message })
   })
 
   router.add('POST', 'api/messages', async (req, res) => {

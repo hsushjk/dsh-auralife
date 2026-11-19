@@ -633,7 +633,7 @@ function renderHistoryMore() {
 }
 
 async function loadOlder(btn) {
-  if (historyState.loading) return
+  if (historyState.loading) return false
   historyState.loading = true
   if (btn) { btn.textContent = '正在取…'; btn.disabled = true }
   const box = $('#msgs')
@@ -642,7 +642,8 @@ async function loadOlder(btn) {
   historyState.loading = false
   if (!r || !r.ok) {
     if (btn) { btn.textContent = '查看更早的记录'; btn.disabled = false }
-    return toast(r?.reason || '没取到更早的记录', 'err')
+    toast(r?.reason || '没取到更早的记录', 'err')
+    return false
   }
   const list = r.messages || []
   if (r.file) { historyState.index = Number(r.file.index) || 0; historyState.total = Number(r.file.total) || 0 }
@@ -658,6 +659,7 @@ async function loadOlder(btn) {
     box.scrollTop = box.scrollHeight - keep
   }
   renderHistoryMore()
+  return true
 }
 
 function mediaUrl(m) {
@@ -789,8 +791,27 @@ function renderQuoteBar() {
   bar.querySelector('.qb-x').onclick = () => setPendingQuote(null)
 }
 
-function focusQuoted(id) {
-  const node = document.querySelector('.msg[data-id="' + cssId(id) + '"]')
+async function focusQuoted(id) {
+  const key = String(id || '').trim()
+  if (!key) return
+  const find = (mid) => document.querySelector('.msg[data-id="' + cssId(mid) + '"]')
+  let node = find(key)
+  if (!node) {
+    // 被引用的那条可能在旧分片里：先问服务端它还在不在，再往前翻页直到翻到。
+    const loc = await api('/api/messages/locate?id=' + encodeURIComponent(key))
+    if (!loc || !loc.ok) { toast(loc?.reason || '那条消息已经找不到了', 'err'); return }
+    const fullId = String((loc.message && loc.message.id) || key)
+    const targetT = Number(loc.message && loc.message.t) || 0
+    let guard = 0
+    while (!(node = find(fullId)) && historyState.hasMore && guard++ < 200) {
+      const before = historyState.oldestAt || 0
+      // 目标比当前最老的还新却找不到，说明它被过期清理了，别再翻了。
+      if (targetT && before && targetT > before) break
+      const more = await loadOlder()
+      if (!more) break
+      if ((historyState.oldestAt || 0) >= before) break
+    }
+  }
   if (!node) { toast('那条消息不在当前加载的记录里', 'err'); return }
   node.scrollIntoView({ block: 'center', behavior: 'smooth' })
   node.classList.add('flash')

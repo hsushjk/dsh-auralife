@@ -22,7 +22,7 @@ dsh-auralife/
 │   ├── life/              生命（一条命，state.json 是唯一真相）
 │   │   ├── state.js       createLife：load/save + 各子域读写（identity/setIdentity/setRhythm/wishes 底层）
 │   │   ├── chemistry.js   三激素：基线+半衰期 decayToward、事件驱动、昼夜节律、慢变量积分
-│   │   ├── energy.js      体力：每轮消耗 0.6、醒 0.8/分、睡 1.6/分恢复（纯作息，沉默轮退一半）
+│   │   ├── energy.js      体力：每轮消耗 1.2、醒 0.1/分、睡 1.6/分恢复（纯作息，沉默轮退一半）
 │   │   ├── wishes.js      执念池：add/resolve/top（张力排序）
 │   │   ├── drive.js       主动搭话：AI 自评 assessUrge（{awake,urge,topic}）→ urge≥55 开口；fireAlarm 闹钟链路
 │   │   ├── self.js        自我演化三层 traits/values/boundaries（merge 同 label 取 max conf）
