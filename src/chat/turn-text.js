@@ -26,6 +26,20 @@ export function rememberTurnText(map, turn, text) {
   }
 }
 
+// 同一轮最多退一次体力。turn/end 重复到达（或同一轮被结束两次）时，
+// 第二次会因为没有文本落进「空轮退款」分支——不退重就会白退，比误判还亏。
+// 没有轮号的老格式没法按轮去重，直接放行（保持旧行为）。
+export function claimTurnRefund(state, turn) {
+  if (turn === undefined || turn === null || turn === '') return true
+  if (!(state.refundedTurns instanceof Set)) state.refundedTurns = new Set()
+  if (state.refundedTurns.has(turn)) return false
+  state.refundedTurns.add(turn)
+  if (state.refundedTurns.size > 24) {
+    for (const k of state.refundedTurns) { state.refundedTurns.delete(k); break }
+  }
+  return true
+}
+
 export function takeTurnText(map, turn) {
   const key = keyOf(turn)
   if (!(map instanceof Map) || key === null) return ''

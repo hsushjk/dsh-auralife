@@ -11,7 +11,7 @@ import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
 import { createPromptSink } from '../core/prompt-sink.js'
 import { quoteOfMessage, resolveQuote } from './quote.js'
-import { initTurnText, rememberTurnText, takeTurnText } from './turn-text.js'
+import { initTurnText, rememberTurnText, takeTurnText, claimTurnRefund } from './turn-text.js'
 
 const WORKSPACE_DIR = process.env.AURALIFE_WORKSPACE || join(homedir(), 'AuraLife', 'chats')
 const WORKSPACE_TITLE = 'AuraLife · Web'
@@ -673,6 +673,16 @@ export function createHub({
     } catch (e) { log.warn('体力退回失败：' + (e?.message || e)) }
   }
 
+  // 同一轮只退一次：重复的 turn/end 会落进「空轮退款」，不退重就白退一份。
+  function refundTurnEnergyOnce(st, turn) {
+    if (!claimTurnRefund(st, turn)) {
+      log.debug?.(`轮 ${turn} 的体力已经退过，忽略重复的退款`)
+      return false
+    }
+    refundTurnEnergy()
+    return true
+  }
+
   function onSessionEvent(session, event) {
     const key = sessionKey(session && session.id)
     const chatId = sessionToChat.get(key)
@@ -735,15 +745,15 @@ export function createHub({
       }
       if (!completed) {
         // 中断的轮也不该按干满一轮算：没发出去就算空轮，退一半。
-        refundTurnEnergy()
+        refundTurnEnergyOnce(st, d.turn)
         log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}），不发，按空轮退一半体力`)
         release(chatId)
         return
       }
-      if (!text) { refundTurnEnergy(); wakeWindowDone().catch(() => {}); return release(chatId) }
+      if (!text) { refundTurnEnergyOnce(st, d.turn); wakeWindowDone().catch(() => {}); return release(chatId) }
       deliver(chatId, text, { wantVoice, userText: lastText })
         // 沉默轮/一个气泡都没发出去的轮：退一半体力（不想说话不该按干了一轮活算）。
-        .then((info) => { if (info && (info.silent || info.sent === 0)) refundTurnEnergy() })
+        .then((info) => { if (info && (info.silent || info.sent === 0)) refundTurnEnergyOnce(st, d.turn) })
         .catch((e) => log.warn('发送出错：' + e.message))
         .finally(() => release(chatId))
     }
