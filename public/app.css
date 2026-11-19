@@ -191,7 +191,7 @@ button:disabled { opacity: .55; cursor: default; }
   background: var(--panel); border: 1px solid var(--line2); border-radius: 999px;
 }
 .bubble .expired { color: var(--muted); font-size: 12px; }
-.msg { max-width: 76%; display: flex; flex-direction: column; }
+.msg { max-width: 76%; min-width: 0; display: flex; flex-direction: column; }
 .msg.me { align-self: flex-end; align-items: flex-end; }
 .msg.her { align-self: flex-start; align-items: flex-start; }
 .msg .sender { font-size: 11px; color: var(--muted); margin: 0 2px 2px; }
@@ -201,7 +201,8 @@ button:disabled { opacity: .55; cursor: default; }
   background: var(--bubble-her);
   border: 1px solid var(--line2);
   border-radius: var(--radius);
-  word-break: break-word; white-space: pre-wrap;
+  box-sizing: border-box; max-width: 100%; min-width: 0;
+  word-break: break-word; overflow-wrap: anywhere; white-space: pre-wrap;
 }
 .msg.me .bubble { background: var(--bubble-me); border-color: transparent; }
 .bubble .meta {
@@ -223,11 +224,16 @@ body[data-theme="dark"] .msg.me .bubble .meta { color: rgba(255, 255, 255, .55);
   margin: 0 0 4px; padding: 4px 8px;
   border-left: 3px solid var(--accent); border-radius: 6px;
   background: rgba(0, 0, 0, .06); font-size: 12px; line-height: 1.35;
-  max-width: 100%; cursor: pointer; overflow: hidden;
+  max-width: 100%; min-width: 0; align-self: stretch; cursor: pointer; overflow: hidden;
 }
 body[data-theme="dark"] .bubble .quote { background: rgba(255, 255, 255, .08); }
-.bubble .quote .q-name { font-size: 11px; color: var(--muted); }
-.bubble .quote .q-text { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .9; }
+.bubble .quote .q-name { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bubble .quote .q-text {
+  color: var(--text); opacity: .9;
+  /* 引用块跟气泡一起收窄：太长就折到 3 行，遇到没空格的串也强制断，别再撑破页面 */
+  white-space: normal; overflow-wrap: anywhere; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
 .composer-quote {
   display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
   padding: 5px 8px; border-left: 3px solid var(--accent); border-radius: 6px;
