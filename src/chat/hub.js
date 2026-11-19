@@ -62,6 +62,9 @@ export function createHub({
   const busyTimers = new Map()
   // 哪个轮号占着 busy：重复的 turn/end 只放开自己那一轮，别误放掉刚开的下一轮。
   const busyTurn = new Map()
+  // markBusy 之后迟迟等不到 turn/start（事件丢了/交付失败）也要提前放开，别只等 5 分钟兜底。
+  const startWaitTimers = new Map()
+  const START_WAIT_MS = 30_000
   const waiting = new Set()
   const usageCache = new Map() // chatId -> { t, tokens, window, ratio }
   const usageReal = new Map() // chatId -> { t, used }（平台 assistant/message.usage 报的真实 token）
@@ -697,7 +700,16 @@ export function createHub({
       if (hasTurn) {
         st.currentTurn = turn
         // 这个轮号正占着这个聊天的 busy，供重复 turn/end 判断「该不该放开」。
-        if (busy.has(chatId)) busyTurn.set(chatId, turn)
+        if (busy.has(chatId)) {
+          busyTurn.set(chatId, turn)
+          const w = startWaitTimers.get(chatId)
+          if (w) { clearTimeout(w); startWaitTimers.delete(chatId) }
+        }
+      } else if (busy.has(chatId)) {
+        // 旧格式没有轮号：至少标记「已经起了轮」，别让 30 秒等待定时器误放。
+        busyTurn.set(chatId, 'unnumbered')
+        const w = startWaitTimers.get(chatId)
+        if (w) { clearTimeout(w); startWaitTimers.delete(chatId) }
       }
       // 同一轮的 turn/start 只扣一次；没有 turn 号（旧格式）时按事件各记一次。
       spendTurnEnergy(st, hasTurn ? turn : null)
@@ -1034,11 +1046,18 @@ export function createHub({
 
   function markBusy(chatId) {
     busy.add(chatId)
-    busyTurn.delete(chatId)
+    busyTurn.set(chatId, null)
     const t = setTimeout(() => {
       if (busy.delete(chatId)) { log.warn(`${chatId} 一轮超过 ${BUSY_MAX_MS / 60000} 分钟，强制放开`); release(chatId) }
     }, BUSY_MAX_MS)
     busyTimers.set(chatId, t)
+    const w = setTimeout(() => {
+      if (!busy.has(chatId) || busyTurn.get(chatId) !== null) return
+      log.warn(`${chatId} 标记忙碌后 ${START_WAIT_MS / 1000} 秒仍没开始一轮，先放开`)
+      release(chatId)
+    }, START_WAIT_MS)
+    if (typeof w.unref === 'function') w.unref()
+    startWaitTimers.set(chatId, w)
   }
 
   async function flush(chatId) {
@@ -1073,6 +1092,8 @@ export function createHub({
     busyTurn.delete(chatId)
     const t = busyTimers.get(chatId)
     if (t) { clearTimeout(t); busyTimers.delete(chatId) }
+    const w = startWaitTimers.get(chatId)
+    if (w) { clearTimeout(w); startWaitTimers.delete(chatId) }
     if (waiting.has(chatId)) { waiting.delete(chatId); flush(chatId) }
   }
 
