@@ -1,10 +1,16 @@
-// chat/turn-text.js — 按轮号暂存本轮最终文本。
+// chat/turn-text.js — 按轮号暂存本轮最终文本、结清每轮体力扣费。
 //
-// 不能只用 st.lastTurn === d.turn 判空轮：轮号对不上（事件乱序、晚到的 turn/end）
-// 时会把「这一轮其实有话」误判成空轮，白退一半体力。这里按轮号存文本，
-// turn/end 只认自己那一轮；同时只留最近十几轮，避免长会话一直涨。
+// 区分两个「轮号」变量，别混用：
+//   st.lastTurn     —— 最近一次有文本的轮，只做旧逻辑兜底；
+//   ledger.lastTurnNo —— 最后见到的轮号，只给「轮号回绕」判断用。
+// 正常乱序时两者可以不相等；拿 st.lastTurn 判回绕会把乱序当成重编号，账被清空却不报错。
 
 const KEEP = 12
+const KEEP_LEDGER = 24
+// 没有轮号的旧格式无法精确配对：只留最近几笔，并在 30 分钟后作废。
+// 插件 dispose、进程被杀留下的残值不能无限期保留，否则下一个真实 turn/end 会把它捡走白退一半。
+const PENDING_TTL_MS = 30 * 60_000
+const PENDING_MAX = 4
 
 export function initTurnText() {
   return new Map()
@@ -26,64 +32,79 @@ export function rememberTurnText(map, turn, text) {
   }
 }
 
-// 同一轮只记一次扣费、只结一次账。turn/end 重复到达时，第二轮不会再退一份体力。
-const KEEP_TURNS = 24
+// ---- 体力扣费账本 ----
+export function initTurnLedger() {
+  return { lastTurnNo: null, chargedTurns: new Set(), settledTurns: new Set(), pendingCharges: [] }
+}
 
 function pruneSet(set) {
   if (!(set instanceof Set)) return
-  if (set.size > KEEP_TURNS) { for (const k of set) { set.delete(k); break } }
+  if (set.size > KEEP_LEDGER) { for (const k of set) { set.delete(k); break } }
+}
+
+function prunePending(ledger, now) {
+  if (!Array.isArray(ledger.pendingCharges)) ledger.pendingCharges = []
+  const list = ledger.pendingCharges
+  const cutoff = now - PENDING_TTL_MS
+  while (list.length && !(Number(list[0]) >= cutoff)) list.shift()
+  return list
 }
 
 // 轮号只在「开新轮」时推进；轮号变小说明会话重建/进程重启后重新编号，旧的记账作废。
-function noteNewTurn(state, turn) {
-  const t = turn === undefined || turn === null || turn === '' ? null : Number(turn)
-  if (t === null || !Number.isFinite(t)) return null
-  const last = Number(state.lastTurnNo)
-  if (Number.isFinite(last) && t < last) {
-    state.chargedTurns = new Set()
-    state.settledTurns = new Set()
-    state.pendingCharge = 0
+function noteNewTurn(ledger, turn) {
+  const raw = turn === undefined || turn === null || turn === '' ? null : Number(turn)
+  if (raw === null || !Number.isFinite(raw)) return null
+  const last = Number(ledger.lastTurnNo)
+  if (Number.isFinite(last) && raw < last) {
+    ledger.chargedTurns = new Set()
+    ledger.settledTurns = new Set()
+    ledger.pendingCharges = []
   }
-  state.lastTurnNo = t
-  return t
+  ledger.lastTurnNo = raw
+  return raw
 }
 
-export function chargeTurn(state, turn) {
-  const t = noteNewTurn(state, turn)
+export function chargeTurn(ledger, turn, now = Date.now()) {
+  if (!ledger || typeof ledger !== 'object') return false
+  const t = noteNewTurn(ledger, turn)
   if (t === null) {
-    state.pendingCharge = (Number(state.pendingCharge) || 0) + 1
+    const list = prunePending(ledger, now)
+    list.push(now)
+    while (list.length > PENDING_MAX) list.shift()
     return true
   }
-  if (!(state.chargedTurns instanceof Set)) state.chargedTurns = new Set()
-  if (state.chargedTurns.has(t)) return false
-  state.chargedTurns.add(t)
-  pruneSet(state.chargedTurns)
+  if (!(ledger.chargedTurns instanceof Set)) ledger.chargedTurns = new Set()
+  if (ledger.chargedTurns.has(t)) return false
+  ledger.chargedTurns.add(t)
+  pruneSet(ledger.chargedTurns)
   return true
 }
 
 // 结清这一轮的扣费（不管退不退）。返回「这轮确实扣过费吗」。
-// 没有轮号的老格式按扣费次数配对：重复的 turn/end 会因没有余额而退不出第二份。
-export function settleTurnCharge(state, turn) {
-  const t = turn === undefined || turn === null || turn === '' ? null : Number(turn)
-  if (t === null || !Number.isFinite(t)) {
-    const pending = Number(state.pendingCharge) || 0
-    if (pending <= 0) return false
-    state.pendingCharge = pending - 1
+// 无轮号时按带时效的扣费队列配对：重复 turn/end 与过期残值都退不出第二份。
+export function settleTurnCharge(ledger, turn, now = Date.now()) {
+  if (!ledger || typeof ledger !== 'object') return false
+  const raw = turn === undefined || turn === null || turn === '' ? null : Number(turn)
+  if (raw === null || !Number.isFinite(raw)) {
+    const list = prunePending(ledger, now)
+    if (!list.length) return false
+    list.shift()
     return true
   }
-  if (!(state.chargedTurns instanceof Set) || !state.chargedTurns.has(t)) return false
-  state.chargedTurns.delete(t)
+  if (!(ledger.chargedTurns instanceof Set) || !ledger.chargedTurns.has(raw)) return false
+  ledger.chargedTurns.delete(raw)
   return true
 }
 
 // 标记这一轮已经结束过；重复的 turn/end 直接忽略。
-export function markSettledTurn(state, turn) {
-  const t = turn === undefined || turn === null || turn === '' ? null : Number(turn)
-  if (t === null || !Number.isFinite(t)) return true
-  if (!(state.settledTurns instanceof Set)) state.settledTurns = new Set()
-  if (state.settledTurns.has(t)) return false
-  state.settledTurns.add(t)
-  pruneSet(state.settledTurns)
+export function markSettledTurn(ledger, turn) {
+  if (!ledger || typeof ledger !== 'object') return true
+  const raw = turn === undefined || turn === null || turn === '' ? null : Number(turn)
+  if (raw === null || !Number.isFinite(raw)) return true
+  if (!(ledger.settledTurns instanceof Set)) ledger.settledTurns = new Set()
+  if (ledger.settledTurns.has(raw)) return false
+  ledger.settledTurns.add(raw)
+  pruneSet(ledger.settledTurns)
   return true
 }
 

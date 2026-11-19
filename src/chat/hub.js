@@ -11,7 +11,7 @@ import { mimeOf } from '../core/image.js'
 import { createHistory, SEGMENT_LIMIT, DEFAULT_KEEP_DAYS } from './history.js'
 import { createPromptSink } from '../core/prompt-sink.js'
 import { quoteOfMessage, resolveQuote } from './quote.js'
-import { initTurnText, rememberTurnText, takeTurnText, chargeTurn, settleTurnCharge, markSettledTurn } from './turn-text.js'
+import { initTurnText, initTurnLedger, rememberTurnText, takeTurnText, chargeTurn, settleTurnCharge, markSettledTurn } from './turn-text.js'
 
 const WORKSPACE_DIR = process.env.AURALIFE_WORKSPACE || join(homedir(), 'AuraLife', 'chats')
 const WORKSPACE_TITLE = 'AuraLife · Web'
@@ -659,10 +659,16 @@ export function createHub({
 
   // 体力按轮扣：turn/start 时一次（工具调用再多也不重复），沉默/空轮在 turn/end 退一半。
   // 只对映射到聊天的会话生效，别的 DSH 会话（比如别的工作区 agent）不耗她的体力。
+  // 体力账本挂在 turnState 上，但内部字段只由 turn-text.js 读写；这里不直接碰 lastTurnNo。
+  function turnLedger(st) {
+    if (!st.ledger || typeof st.ledger !== 'object') st.ledger = initTurnLedger()
+    return st.ledger
+  }
+
   function spendTurnEnergy(st, turn) {
     const energy = energyOf()
     if (!energy?.spendTurn) return false
-    if (!chargeTurn(st, turn)) return false
+    if (!chargeTurn(turnLedger(st), turn)) return false
     try {
       const p = energy.spendTurn()
       if (p && typeof p.catch === 'function') p.catch((e) => log.warn('体力消耗失败：' + (e?.message || e)))
@@ -681,7 +687,7 @@ export function createHub({
     const key = sessionKey(session && session.id)
     const chatId = sessionToChat.get(key)
     if (!chatId || !event) return
-    const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set(), turnText: initTurnText() }
+    const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set(), turnText: initTurnText(), ledger: initTurnLedger() }
     turnState.set(key, st)
     if (event.type === 'turn/start') {
       const turn = Number((event.data || {}).turn)
@@ -717,12 +723,12 @@ export function createHub({
       const d = event.data || {}
       const turn = Number(d.turn)
       const hasTurn = Number.isFinite(turn)
-      if (hasTurn && !markSettledTurn(st, turn)) {
+      if (hasTurn && !markSettledTurn(turnLedger(st), turn)) {
         log.debug?.(`${chatId} 重复的 turn/end（轮 ${turn}）已忽略`)
         return
       }
       // 这一轮的扣费在 turn/end 结清：退不退都只可能结一次；没扣过费的轮不退（防白退）。
-      const charged = settleTurnCharge(st, hasTurn ? turn : null)
+      const charged = settleTurnCharge(turnLedger(st), hasTurn ? turn : null)
       const completed = d.reason && d.reason.kind === 'completed'
       // 按轮号取：晚到/乱序的 turn/end 也能拿到自己那一轮的文本，不会把有空轮的判成空轮。
       const byTurn = takeTurnText(st.turnText, d.turn)
@@ -1073,7 +1079,7 @@ export function createHub({
     const agent = await agentFor(chat)
     const key = sessionKey(agent.session?.id)
     let st = turnState.get(key)
-    if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), lastText: '', prevText: '', turnText: initTurnText() }; turnState.set(key, st) }
+    if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), lastText: '', prevText: '', turnText: initTurnText(), ledger: initTurnLedger() }; turnState.set(key, st) }
     if (senderId) st.senders.add(senderId)
     const textPart = (content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n')
     if (textPart) { st.prevText = st.lastText; st.lastText = textPart }
@@ -1118,7 +1124,7 @@ export function createHub({
         const agent = await agentFor(chat)
         key = sessionKey(agent.session?.id)
         let st = turnState.get(key)
-        if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), turnText: initTurnText() }; turnState.set(key, st) }
+        if (!st) { st = { lastTurn: -1, text: '', senders: new Set(), turnText: initTurnText(), ledger: initTurnLedger() }; turnState.set(key, st) }
         st.system = { resolve, reject }
         timer = setTimeout(() => {
           const s = turnState.get(key)
@@ -1130,7 +1136,8 @@ export function createHub({
             s.systemTimedOut = true
             // 超时的系统轮没干完活，按空轮退一半；标记已结束，晚到的 turn/end 不会再退一次。
             const turn = Number.isFinite(Number(s.currentTurn)) ? Number(s.currentTurn) : null
-            if (turn !== null && markSettledTurn(s, turn) && settleTurnCharge(s, turn)) refundTurnEnergy()
+            const ledger = turnLedger(s)
+            if (turn !== null && markSettledTurn(ledger, turn) && settleTurnCharge(ledger, turn)) refundTurnEnergy()
             reject(new Error('这一轮超时了'))
           }
         }, timeoutMs)
@@ -1156,7 +1163,8 @@ export function createHub({
           s.sysTimer = null
           s.systemTimedOut = false
           const turn = Number.isFinite(Number(s.currentTurn)) ? Number(s.currentTurn) : null
-          if (turn !== null && markSettledTurn(s, turn) && settleTurnCharge(s, turn)) refundTurnEnergy()
+          const ledger = turnLedger(s)
+          if (turn !== null && markSettledTurn(ledger, turn) && settleTurnCharge(ledger, turn)) refundTurnEnergy()
         }
         reject(e)
       }
