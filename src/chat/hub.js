@@ -868,7 +868,7 @@ export function createHub({
     } else if (text) content.push({ type: 'text', text })
     if (userSticker) {
 
-      content.push({ type: 'text', text: `【对方发来一张表情包${userSticker.name ? '：' + userSticker.name : ''}，看着接梗，或者也回一个 <sticker:标签>】` })
+      content.push({ type: 'text', text: `【对方发来一张表情包${userSticker.name ? '：' + userSticker.name : ''}，看着接梗，或者也回一个 sticker】` })
     }
     for (const img of images) {
       content.push({ type: 'image', data: img.data, mediaType: img.mediaType || 'image/png', name: img.name || 'image' })
